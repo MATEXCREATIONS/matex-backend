@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const BASE = 'http://localhost:5001';
+const BASE = 'https://matex-backend.onrender.com';
 const ADMIN_PASSWORD = 'MatexAdmin2026'; // matches matex-backend/.env
 
 function log(...args){ console.log('[e2e]', ...args); }

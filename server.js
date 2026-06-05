@@ -16,11 +16,16 @@ const envPath = path.resolve(__dirname, '.env');
 dotenv.config({ path: envPath });
 
 const app = express();
-// Lock backend to port 5001 to avoid accidental multi-port fallbacks
-const PORT = 5001;
+// Use PORT from environment (Render assigns this), fallback to 5001 for local development
+const PORT = process.env.PORT || 5001;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','Accept']
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // Paystack Configuration
@@ -131,6 +136,40 @@ function buildDesignerNotificationHtml(order) {
 
 // In-memory order store for payment tracking and verification
 const orderStore = new Map();
+
+// In-memory reviews store (fallback when Supabase not configured)
+const reviewStore = new Map();
+
+async function persistReview(review) {
+  if (!review || !review.id) return review;
+  if (!supabase) {
+    reviewStore.set(review.id, review);
+    return review;
+  }
+  try {
+    const payload = {
+      id: review.id,
+      full_name: review.full_name,
+      company: review.company || null,
+      rating: review.rating,
+      message: review.message,
+      status: review.status || 'Pending',
+      created_at: review.created_at || new Date().toISOString()
+    };
+    const { data, error } = await supabase.from('matex_reviews').upsert([payload], { onConflict: 'id' }).select();
+    if (error) {
+      console.error('Supabase persistReview error:', error);
+      throw error;
+    }
+    if (Array.isArray(data) && data.length > 0) {
+      return data[0];
+    }
+    return review;
+  } catch (err) {
+    console.error('persistReview exception:', err.message || err);
+    throw err;
+  }
+}
 
 const SUPABASE_ORDER_FIELDS = [
   'order_id',
@@ -904,111 +943,137 @@ app.post('/api/orders/brief', async (req, res) => {
 });
 
 /**
- * PUT /api/orders/:orderId/status
+ * PUT /api/admin/orders/:orderId/status
  * Update order status and optionally send notification to customer
  * 
  * Body:
- * - status (string): New order status (Accepted, In Progress, Almost Done, Completed)
+ * - status (string): New order status
  * - message (string, optional): Message to include in notification email
  */
-// Require admin authentication to change order lifecycle/status
-app.put('/api/orders/:orderId/status', adminAuth, async (req, res) => {
-  console.log(`📍 PUT /api/orders/${req.params.orderId}/status - Update order status`);
+app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
+  console.log(`📍 PUT /api/admin/orders/${req.params.orderId}/status - Update order status`);
   try {
     const { orderId } = req.params;
-    const { status, message } = req.body;
+    const { status, message } = req.body || {};
 
-    if(!orderId || !status){
-      return res.status(400).json({
-        success: false,
-        message: 'orderId and status are required'
-      });
+    if (!orderId || !status) {
+      return res.status(400).json({ success: false, message: 'orderId and status are required' });
     }
 
-    if(supabase){
+    const statusNote = message ? String(message).trim() : `Status updated to ${status}.`;
+    let updatedOrder = null;
+    let existingOrder = null;
+
+    if (supabase) {
+      try {
+        const { data: existingData, error: existingError } = await supabase
+          .from('matex_orders')
+          .select('order_status, latest_progress, client_email, service_name, order_id')
+          .eq('order_id', orderId)
+          .limit(1)
+          .single();
+
+        if (!existingError && existingData) {
+          existingOrder = existingData;
+        }
+      } catch (err) {
+        console.warn('Supabase existing order fetch warning:', err.message || err);
+      }
+
+      const previousProgress = existingOrder?.latest_progress ? String(existingOrder.latest_progress).trim() : '';
+      const newProgress = previousProgress ? `${previousProgress}\n${statusNote}` : statusNote;
+
       try {
         const { data, error } = await supabase
           .from('matex_orders')
-          .update({ 
-            order_status: status,
-            latest_progress: message || `Status updated to ${status}`
-          })
-          .eq('order_id', orderId);
-
-        if(error){
-          console.error('Supabase update error:', error);
-          return res.status(500).json({ success: false, message: 'Failed to update order' });
-        }
-
-        // Fetch updated order to get client email
-        const { data: orderData, error: fetchError } = await supabase
-          .from('matex_orders')
-          .select('client_email, service_name, order_id')
+          .update({ order_status: status, latest_progress: newProgress })
           .eq('order_id', orderId)
-          .limit(1);
+          .select()
+          .limit(1)
+          .single();
 
-        if(!fetchError && orderData && orderData[0] && orderData[0].client_email){
-          // Send notification email to customer
-          const customerNotificationHtml = `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #f5f5f5; padding: 20px; border-radius: 10px;">
-              <h2 style="color: #8b0000; text-align: center;">Order Update</h2>
-              <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-                <p><strong>Order ID:</strong> ${orderId}</p>
-                <p><strong>Service:</strong> ${orderData[0].service_name}</p>
-                <p><strong>Status:</strong> <span style="color: #22c55e; font-weight: bold;">${status}</span></p>
-                ${message ? `<p><strong>Update:</strong> ${message}</p>` : ''}
-              </div>
-              <p>Thank you for your patience. We're working hard to bring your vision to life!</p>
-              <p style="color: #666; font-size: 12px; margin-top: 30px;">— Matex Creations Team</p>
-            </div>
-          `;
-          sendEmail(orderData[0].client_email, `Order Update - ${orderId}`, customerNotificationHtml);
+        if (error) {
+          console.error('Supabase update error:', error);
+          throw new Error('Failed to update order');
         }
-
-        return res.json({ 
-          success: true, 
-          message: 'Order status updated',
-          order: { order_id: orderId, status }
-        });
-      } catch(err){
-        console.error('Order update exception:', err.message);
-        return res.status(500).json({ success: false, message: 'Failed to update order' });
+        if (data) {
+          updatedOrder = data;
+        }
+      } catch (err) {
+        console.warn('Supabase status update fallback warning:', err.message || err);
       }
     }
 
-    // Fallback to in-memory store
-    const order = orderStore.get(orderId);
-    if(!order){
-      return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!updatedOrder) {
+      const order = orderStore.get(orderId);
+      if (!order) {
+        return res.status(404).json({ success: false, message: 'Order not found' });
+      }
+      const existingProgress = order.latest_progress ? String(order.latest_progress).trim() : '';
+      const newProgress = existingProgress ? `${existingProgress}\n${statusNote}` : statusNote;
+      updatedOrder = {
+        ...order,
+        status,
+        order_status: status,
+        latest_progress: newProgress,
+        status_history: Array.isArray(order.status_history) ? [...order.status_history, { status, message: statusNote, updated_at: new Date().toISOString() }] : [{ status, message: statusNote, updated_at: new Date().toISOString() }]
+      };
+      orderStore.set(orderId, updatedOrder);
     }
 
-    order.status = status;
-    order.latest_progress = message || `Status updated to ${status}`;
-    orderStore.set(orderId, order);
+    if (updatedOrder && updatedOrder.client_email) {
+      try {
+        await sendEmail(
+          updatedOrder.client_email,
+          `Order Update - ${updatedOrder.order_id}`,
+          buildCustomerNotificationHtml(updatedOrder, statusNote)
+        );
+      } catch (emailError) {
+        console.error('Admin customer notification failed:', emailError.message || emailError);
+      }
+    }
 
-    return res.json({ 
-      success: true, 
-      message: 'Order status updated',
-      order: { order_id: orderId, status }
-    });
-  } catch(err){
+    return res.json({ success: true, message: 'Order status updated', order: { order_id: orderId, status } });
+  } catch (err) {
     console.error('Update order status error:', err.message);
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to update order status',
-      error: err.message
-    });
+    return res.status(500).json({ success: false, message: 'Failed to update order status', error: err.message });
+  }
+});
+
+app.post('/api/admin/email-test', adminAuth, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ success: false, message: 'A valid email is required' });
+    }
+
+    const sanitizedEmail = String(email).trim();
+    const html = `
+      <div style="font-family: Arial, sans-serif; max-width: 680px; margin: 0 auto; background: #f5f5f5; padding: 24px; border-radius: 12px;">
+        <h2 style="color: #8b0000; text-align: center;">Matex Email Test</h2>
+        <div style="background: white; padding: 20px; border-radius: 10px; margin-top: 18px;">
+          <p>This is a test email from the Matex admin dashboard.</p>
+          <p><strong>Recipient:</strong> ${sanitizedEmail}</p>
+          <p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>
+        </div>
+      </div>
+    `;
+
+    const sent = await sendEmail(sanitizedEmail, 'Matex Admin Email Test', html);
+    if (!sent) {
+      return res.status(500).json({ success: false, message: 'Unable to send test email' });
+    }
+
+    return res.json({ success: true, message: `Test email sent to ${sanitizedEmail}` });
+  } catch (err) {
+    console.error('Admin email test error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Failed to send test email', error: err.message });
   }
 });
 
 /**
  * POST /send-designer-notification
- * Send order notification to designer
- * 
- * Body:
- * - orderId (string): Order ID
- */
-app.post('/api/designer/notify', async (req, res) => {
+
   console.log('📍 POST /api/designer/notify - Send designer notification');
   try {
     const { orderId } = req.body;
@@ -1069,6 +1134,158 @@ app.post('/api/designer/notify', async (req, res) => {
       error: err.message
     });
   }
+});
+
+/**
+ * Reviews API
+ */
+
+// Public: submit a review
+app.post('/api/reviews', async (req, res) => {
+  try {
+    const { full_name, company, rating, message } = req.body || {};
+    if (!full_name || !message || typeof rating === 'undefined') {
+      return res.status(400).json({ success: false, message: 'full_name, rating and message are required' });
+    }
+    const r = {
+      id: crypto.randomUUID ? crypto.randomUUID() : crypto.createHash('sha1').update(Date.now().toString()).digest('hex'),
+      full_name: String(full_name).trim(),
+      company: company ? String(company).trim() : null,
+      rating: Math.max(1, Math.min(5, Number(rating) || 1)),
+      message: String(message).trim(),
+      status: 'Pending',
+      created_at: new Date().toISOString()
+    };
+
+    // Persist
+    let storedReview = null;
+    try {
+      storedReview = await persistReview(r);
+    } catch (persistError) {
+      console.error('Submit review persistence failed:', persistError.message || persistError);
+      return res.status(500).json({ success: false, message: 'Failed to save review: ' + (persistError.message || 'Unknown error') });
+    }
+
+    return res.json({ success: true, message: 'Review submitted', review: { id: storedReview.id || r.id, status: storedReview.status || r.status } });
+  } catch (err) {
+    console.error('Submit review error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Failed to submit review' });
+  }
+});
+
+// Public: get approved reviews
+app.get('/api/reviews', async (req, res) => {
+  try {
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_reviews').select('*').eq('status', 'Approved').order('created_at', { ascending: false });
+      if (error) {
+        console.error('Supabase fetch reviews error:', error);
+      } else {
+        return res.json({ success: true, reviews: data || [] });
+      }
+    }
+
+    // Fallback to in-memory approved reviews
+    const reviews = Array.from(reviewStore.values()).filter(r => r.status === 'Approved').sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return res.json({ success: true, reviews });
+  } catch (err) {
+    console.error('Get reviews error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load reviews' });
+  }
+});
+
+// Admin: list all reviews (pending/approved/rejected)
+app.get('/api/admin/reviews', adminAuth, async (req, res) => {
+  try {
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_reviews').select('*').order('created_at', { ascending: false });
+      if (error) {
+        console.error('Supabase admin fetch reviews error:', error);
+        return res.status(500).json({ success: false, message: 'Unable to load admin reviews' });
+      }
+      return res.json({ success: true, reviews: data || [] });
+    }
+    const reviews = Array.from(reviewStore.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    return res.json({ success: true, reviews });
+  } catch (err) {
+    console.error('Admin get reviews error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load reviews' });
+  }
+});
+
+async function updateAdminReviewStatus(req, res, forcedStatus = null) {
+  try {
+    const id = String(req.params.id || '').trim();
+    const status = forcedStatus || (req.body || {}).status;
+    if (!id || !status) return res.status(400).json({ success: false, message: 'id and status are required' });
+
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_reviews').update({ status }).eq('id', id).select().limit(1).single();
+      if (error) {
+        console.error('Supabase update review error:', error);
+      } else {
+        return res.json({ success: true, review: data });
+      }
+    }
+
+    const existing = reviewStore.get(id);
+    if (!existing) return res.status(404).json({ success: false, message: 'Review not found' });
+    existing.status = status;
+    reviewStore.set(id, existing);
+    return res.json({ success: true, review: existing });
+  } catch (err) {
+    console.error('Admin update review error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to update review' });
+  }
+}
+
+// Admin: update review status (approve/reject)
+app.put('/api/admin/reviews/:id', adminAuth, async (req, res) => updateAdminReviewStatus(req, res));
+app.put('/api/admin/reviews/:id/approve', adminAuth, async (req, res) => updateAdminReviewStatus(req, res, 'Approved'));
+app.put('/api/admin/reviews/:id/reject', adminAuth, async (req, res) => updateAdminReviewStatus(req, res, 'Rejected'));
+
+// Admin: delete review
+app.delete('/api/admin/reviews/:id', adminAuth, async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) return res.status(400).json({ success: false, message: 'id is required' });
+    if (supabase) {
+      const { error } = await supabase.from('matex_reviews').delete().eq('id', id);
+      if (error) {
+        console.error('Supabase delete review error:', error);
+      } else {
+        return res.json({ success: true });
+      }
+    }
+    reviewStore.delete(id);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Admin delete review error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to delete review' });
+  }
+});
+
+function getRegisteredRoutes() {
+  const routes = [];
+  if (!app || !app._router || !app._router.stack) return routes;
+  app._router.stack.forEach(layer => {
+    if (layer.route && layer.route.path) {
+      const methods = Object.keys(layer.route.methods || {}).map(m => m.toUpperCase()).join(', ');
+      routes.push(`${methods} ${layer.route.path}`);
+    } else if (layer.name === 'router' && layer.handle && layer.handle.stack) {
+      layer.handle.stack.forEach(subLayer => {
+        if (subLayer.route && subLayer.route.path) {
+          const methods = Object.keys(subLayer.route.methods || {}).map(m => m.toUpperCase()).join(', ');
+          routes.push(`${methods} ${subLayer.route.path}`);
+        }
+      });
+    }
+  });
+  return routes.sort();
+}
+
+app.get('/api/routes', (req, res) => {
+  return res.json({ success: true, routes: getRegisteredRoutes() });
 });
 
 /**

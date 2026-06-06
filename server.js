@@ -81,6 +81,86 @@ async function sendEmail(to, subject, html, fromEmail = NOREPLY_EMAIL) {
   }
 }
 
+function classifySmtpError(err) {
+  const message = String(err?.message || err || '').toLowerCase();
+  const code = String(err?.code || '').toUpperCase();
+
+  if (code === 'EAUTH' || message.includes('authentication failed') || message.includes('invalid login') || message.includes('username and password not accepted')) {
+    return {
+      diagnosis: 'invalid credentials',
+      reason: 'SMTP authentication failed.'
+    };
+  }
+
+  if (code === 'ENOTFOUND' || message.includes('getaddrinfo') || message.includes('host not found')) {
+    return {
+      diagnosis: 'wrong host',
+      reason: 'SMTP host could not be resolved.'
+    };
+  }
+
+  if (code === 'ECONNREFUSED' || message.includes('refused') || message.includes('wrong port')) {
+    return {
+      diagnosis: 'wrong port or blocked SMTP',
+      reason: 'The SMTP server rejected the connection or the port is not open.'
+    };
+  }
+
+  if (code === 'ETIMEDOUT' || code === 'ECONNRESET' || message.includes('timed out') || message.includes('timeout')) {
+    return {
+      diagnosis: 'Render outbound connection issue',
+      reason: 'The SMTP connection timed out from the Render environment.'
+    };
+  }
+
+  return {
+    diagnosis: 'unknown SMTP issue',
+    reason: 'SMTP verification failed for an unclassified reason.'
+  };
+}
+
+async function runSmtpDiagnostics(targetEmail) {
+  const transporter = emailTransporter || nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    tls: { rejectUnauthorized: false },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000
+  });
+
+  const diagnostics = {
+    smtpHost: SMTP_HOST,
+    smtpPort: SMTP_PORT,
+    smtpSecure: SMTP_SECURE,
+    connectionSuccess: false,
+    authenticationSuccess: false,
+    diagnosis: 'not checked',
+    reason: '',
+    targetEmail: typeof targetEmail === 'string' ? targetEmail.trim() : ''
+  };
+
+  try {
+    await transporter.verify({ timeout: 20000 });
+    diagnostics.connectionSuccess = true;
+    diagnostics.authenticationSuccess = true;
+    diagnostics.diagnosis = 'SMTP connection and authentication succeeded.';
+    diagnostics.reason = 'The SMTP server accepted the connection and credentials.';
+  } catch (err) {
+    const classification = classifySmtpError(err);
+    diagnostics.connectionSuccess = false;
+    diagnostics.authenticationSuccess = false;
+    diagnostics.diagnosis = classification.diagnosis;
+    diagnostics.reason = classification.reason;
+    diagnostics.error = err?.message || String(err);
+    diagnostics.errorCode = err?.code || null;
+  }
+
+  return diagnostics;
+}
+
 function buildCustomerNotificationHtml(order, customMessage = '') {
   const name = order.client_name || order.full_name || 'Valued Customer';
   const service = order.service_name || order.service || 'Your service';
@@ -956,6 +1036,8 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
     const { orderId } = req.params;
     const { status, message } = req.body || {};
 
+    console.log('[status-update] request payload:', JSON.stringify({ orderId, status, message }, null, 2));
+
     if (!orderId || !status) {
       return res.status(400).json({ success: false, message: 'orderId and status are required' });
     }
@@ -1033,7 +1115,17 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
       }
     }
 
-    return res.json({ success: true, message: 'Order status updated', order: { order_id: orderId, status } });
+    const responseOrder = {
+      order_id: orderId,
+      status,
+      order_status: status,
+      latest_progress: updatedOrder?.latest_progress || statusNote,
+      updated_at: updatedOrder?.updated_at || new Date().toISOString()
+    };
+
+    console.log('[status-update] backend response:', JSON.stringify({ success: true, message: 'Order status updated successfully.', order: responseOrder }, null, 2));
+
+    return res.json({ success: true, message: 'Order status updated successfully.', order: responseOrder });
   } catch (err) {
     console.error('Update order status error:', err.message);
     return res.status(500).json({ success: false, message: 'Failed to update order status', error: err.message });
@@ -1042,7 +1134,19 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
 
 app.post('/api/admin/email-test', adminAuth, async (req, res) => {
   try {
-    const { email } = req.body || {};
+    const { email, diagnostics = false } = req.body || {};
+
+    if (diagnostics === true) {
+      const diagnosticsResult = await runSmtpDiagnostics(typeof email === 'string' ? email.trim() : '');
+      return res.json({
+        success: diagnosticsResult.connectionSuccess && diagnosticsResult.authenticationSuccess,
+        diagnostics: diagnosticsResult,
+        message: diagnosticsResult.connectionSuccess && diagnosticsResult.authenticationSuccess
+          ? 'SMTP diagnostics passed.'
+          : 'SMTP diagnostics failed.'
+      });
+    }
+
     if (!email || typeof email !== 'string') {
       return res.status(400).json({ success: false, message: 'A valid email is required' });
     }
@@ -1061,7 +1165,12 @@ app.post('/api/admin/email-test', adminAuth, async (req, res) => {
 
     const sent = await sendEmail(sanitizedEmail, 'Matex Admin Email Test', html);
     if (!sent) {
-      return res.status(500).json({ success: false, message: 'Unable to send test email' });
+      const diagnosticsResult = await runSmtpDiagnostics(sanitizedEmail);
+      return res.status(500).json({
+        success: false,
+        message: 'Unable to send test email',
+        diagnostics: diagnosticsResult
+      });
     }
 
     return res.json({ success: true, message: `Test email sent to ${sanitizedEmail}` });

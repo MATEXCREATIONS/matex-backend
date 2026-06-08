@@ -4,6 +4,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
+import multer from 'multer';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -27,13 +28,40 @@ app.use(cors({
 }));
 app.options('*', cors());
 app.use(express.json());
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Paystack Configuration
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_API_URL = 'https://api.paystack.co';
 
+// Service Pricing Configuration - SINGLE SOURCE OF TRUTH
+const SERVICE_PRICING = {
+  'Graphic Design': {
+    name: 'Graphic Design',
+    description: 'Flyers • Posters • Logos',
+    naira: 6000,
+    usd: 4,
+    currency: 'NGN'
+  },
+  'Video Editing': {
+    name: 'Video Editing',
+    description: 'YouTube edits • Ad videos • Showreels',
+    naira: 9000,
+    usd: 6,
+    currency: 'NGN'
+  },
+  'Brand Identity': {
+    name: 'Brand Identity',
+    description: 'Complete branding packages',
+    naira: 15000,
+    usd: 10,
+    currency: 'NGN'
+  }
+};
+
 // Email Configuration
 let emailTransporter = null;
+let smtpTransporterVerified = false;
 const DESIGNER_EMAIL = process.env.DESIGNER_EMAIL || process.env.DESINGER_EMAIL || 'designer@matexcreations.com';
 const NOREPLY_EMAIL = process.env.NOREPLY_EMAIL || 'noreply@matexcreations.com';
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
@@ -41,44 +69,166 @@ const SMTP_PORT = Number(process.env.SMTP_PORT || '587');
 const SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
 const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
+const hasSMTPPass = Boolean(SMTP_PASS);
 
-if (SMTP_USER && SMTP_PASS) {
-  emailTransporter = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS
-    },
-    tls: {
-      rejectUnauthorized: false
-    }
-  });
-  console.log('✅ Email service configured');
-} else {
-  console.warn('⚠️ Email configuration incomplete; email notifications disabled');
+const smtpConfig = {
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_SECURE,
+  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+  tls: {
+    rejectUnauthorized: false
+  },
+  connectionTimeout: 30000,
+  greetingTimeout: 15000,
+  socketTimeout: 45000,
+  pool: {
+    maxConnections: 5,
+    maxMessages: 100,
+    rateDelta: 20,
+    rateLimit: 14
+  }
+};
+
+function isGmailHost(host) {
+  return String(host || '').toLowerCase().includes('gmail.com');
 }
 
-// Helper: Send email
-async function sendEmail(to, subject, html, fromEmail = NOREPLY_EMAIL) {
+function getSmtpConfigurationCause() {
+  if (!process.env.SMTP_HOST) {
+    return { cause: 'Missing Environment Variable', message: 'SMTP_HOST is not configured.' };
+  }
+  if (!process.env.SMTP_PORT) {
+    return { cause: 'Missing Environment Variable', message: 'SMTP_PORT is not configured.' };
+  }
+  if (!process.env.SMTP_USER) {
+    return { cause: 'Missing Environment Variable', message: 'SMTP_USER is not configured.' };
+  }
+  if (!hasSMTPPass) {
+    return { cause: 'Missing App Password', message: 'SMTP_PASS is not configured. Gmail SMTP requires an app password.' };
+  }
+  if (isGmailHost(SMTP_HOST)) {
+    if (SMTP_PORT === 465 && !SMTP_SECURE) {
+      return { cause: 'Wrong Secure Setting', message: 'Gmail port 465 requires secure=true.' };
+    }
+    if (SMTP_PORT === 587 && SMTP_SECURE) {
+      return { cause: 'Wrong Secure Setting', message: 'Gmail port 587 requires secure=false.' };
+    }
+    if (![465, 587].includes(SMTP_PORT)) {
+      return { cause: 'Wrong Port', message: 'Gmail SMTP should use port 587 (secure=false) or 465 (secure=true).' };
+    }
+  }
+  return { cause: 'ok', message: 'SMTP configuration appears valid.' };
+}
+
+if (SMTP_USER && SMTP_PASS) {
+  emailTransporter = nodemailer.createTransport(smtpConfig);
+  console.log('✅ Email service configured with connection pooling');
+  console.log(`   SMTP_HOST: ${SMTP_HOST}`);
+  console.log(`   SMTP_PORT: ${SMTP_PORT}`);
+  console.log(`   SMTP_USER: ${SMTP_USER || '(not set)'}`);
+  console.log(`   hasSMTPPass: ${hasSMTPPass}`);
+  const configCheck = getSmtpConfigurationCause();
+  if (configCheck.cause !== 'ok') {
+    console.warn(`   SMTP configuration warning: ${configCheck.cause} - ${configCheck.message}`);
+  }
+} else {
+  console.warn('⚠️ Email configuration incomplete; email notifications disabled');
+  if (!SMTP_USER) console.warn('   Missing: SMTP_USER');
+  if (!SMTP_PASS) console.warn('   Missing: SMTP_PASS');
+}
+
+async function ensureTransporterVerified() {
+  if (!emailTransporter) {
+    return {
+      success: false,
+      cause: 'Missing Environment Variable',
+      diagnosis: 'Email transporter is not configured because SMTP_USER or SMTP_PASS is missing.',
+      reason: 'Set SMTP_USER and SMTP_PASS in your environment. For Gmail, use an app password.'
+    };
+  }
+
+  if (smtpTransporterVerified) {
+    return { success: true };
+  }
+
+  const configCause = getSmtpConfigurationCause();
+  if (configCause.cause !== 'ok') {
+    return {
+      success: false,
+      cause: configCause.cause,
+      diagnosis: configCause.message,
+      reason: configCause.message
+    };
+  }
+
+  try {
+    await emailTransporter.verify({ timeout: 20000 });
+    smtpTransporterVerified = true;
+    return { success: true };
+  } catch (err) {
+    const classification = classifySmtpError(err);
+    return {
+      success: false,
+      cause: classification.cause,
+      diagnosis: classification.diagnosis,
+      reason: classification.reason,
+      error: err?.message || String(err),
+      errorCode: err?.code || null,
+      command: err?.command || null
+    };
+  }
+}
+
+// Helper: Send email with retry logic
+async function sendEmail(to, subject, html, fromEmail = NOREPLY_EMAIL, retries = 2) {
   if (!emailTransporter) {
     console.warn('⚠️ Email transporter not configured');
     return false;
   }
-  try {
-    await emailTransporter.sendMail({
-      from: fromEmail,
-      to,
-      subject,
-      html
+
+  const verifyResult = await ensureTransporterVerified();
+  if (!verifyResult.success) {
+    console.error('❌ SMTP verification failed before sending email:', {
+      cause: verifyResult.cause,
+      diagnosis: verifyResult.diagnosis,
+      reason: verifyResult.reason
     });
-    console.log(`✅ Email sent to ${to}: ${subject}`);
-    return true;
-  } catch (err) {
-    console.error(`❌ Failed to send email to ${to}:`, err);
     return false;
   }
+  
+  for (let attempt = 1; attempt <= retries + 1; attempt++) {
+    try {
+      const result = await emailTransporter.sendMail({
+        from: fromEmail,
+        to,
+        subject,
+        html
+      });
+      console.log(`✅ Email sent to ${to}: ${subject} (Attempt ${attempt})`);
+      return true;
+    } catch (err) {
+      const isLastAttempt = attempt === retries + 1;
+      const classification = classifySmtpError(err);
+      console.error(`❌ Email send attempt ${attempt}/${retries + 1} failed to ${to}:`, {
+        message: err?.message || String(err),
+        code: err?.code,
+        cause: classification.cause,
+        diagnosis: classification.diagnosis,
+        reason: classification.reason
+      });
+      
+      if (isLastAttempt) {
+        console.error(`❌ All ${retries + 1} attempts failed for ${to}`);
+        return false;
+      }
+      
+      const delay = attempt * 1000;
+      console.log(`   Retrying in ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  return false;
 }
 
 function classifySmtpError(err) {
@@ -87,60 +237,82 @@ function classifySmtpError(err) {
 
   if (code === 'EAUTH' || message.includes('authentication failed') || message.includes('invalid login') || message.includes('username and password not accepted')) {
     return {
-      diagnosis: 'invalid credentials',
-      reason: 'SMTP authentication failed.'
+      cause: 'Gmail Authentication Failure',
+      diagnosis: 'SMTP authentication failed.',
+      reason: 'The username/password or app password is invalid.'
     };
   }
 
   if (code === 'ENOTFOUND' || message.includes('getaddrinfo') || message.includes('host not found')) {
     return {
-      diagnosis: 'wrong host',
-      reason: 'SMTP host could not be resolved.'
+      cause: 'Wrong Host',
+      diagnosis: 'SMTP host could not be resolved.',
+      reason: 'The configured SMTP_HOST is invalid or unreachable.'
     };
   }
 
   if (code === 'ECONNREFUSED' || message.includes('refused') || message.includes('wrong port')) {
     return {
-      diagnosis: 'wrong port or blocked SMTP',
-      reason: 'The SMTP server rejected the connection or the port is not open.'
+      cause: 'Wrong Port',
+      diagnosis: 'The SMTP server rejected the connection or the port is blocked.',
+      reason: 'Check SMTP_PORT and network firewall rules.'
     };
   }
 
   if (code === 'ETIMEDOUT' || code === 'ECONNRESET' || message.includes('timed out') || message.includes('timeout')) {
     return {
-      diagnosis: 'Render outbound connection issue',
-      reason: 'The SMTP connection timed out from the Render environment.'
+      cause: 'Render outbound connection issue',
+      diagnosis: 'The SMTP connection timed out.',
+      reason: 'The environment could not establish a connection to the SMTP server.'
+    };
+  }
+
+  if (message.includes('ssl') || message.includes('tls') || message.includes('secure')) {
+    return {
+      cause: 'Wrong Secure Setting',
+      diagnosis: 'Secure/TLS settings appear invalid for the configured SMTP port.',
+      reason: 'Check SMTP_SECURE and SMTP_PORT for your SMTP provider.'
     };
   }
 
   return {
-    diagnosis: 'unknown SMTP issue',
-    reason: 'SMTP verification failed for an unclassified reason.'
+    cause: 'Unknown SMTP Issue',
+    diagnosis: 'SMTP verification failed for an unclassified reason.',
+    reason: 'Inspect logs and SMTP configuration for additional details.'
   };
 }
 
 async function runSmtpDiagnostics(targetEmail) {
+  const configStatus = getSmtpConfigurationCause();
+  const diagnostics = {
+    smtpHost: SMTP_HOST,
+    smtpPort: SMTP_PORT,
+    smtpSecure: SMTP_SECURE,
+    smtpUser: SMTP_USER || null,
+    hasSMTPPass,
+    configCause: configStatus.cause,
+    configMessage: configStatus.message,
+    connectionSuccess: false,
+    authenticationSuccess: false,
+    diagnosis: configStatus.cause,
+    reason: configStatus.message,
+    targetEmail: typeof targetEmail === 'string' ? targetEmail.trim() : ''
+  };
+
+  if (configStatus.cause !== 'ok') {
+    return diagnostics;
+  }
+
   const transporter = emailTransporter || nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
     secure: SMTP_SECURE,
-    auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
     tls: { rejectUnauthorized: false },
     connectionTimeout: 15000,
     greetingTimeout: 15000,
     socketTimeout: 20000
   });
-
-  const diagnostics = {
-    smtpHost: SMTP_HOST,
-    smtpPort: SMTP_PORT,
-    smtpSecure: SMTP_SECURE,
-    connectionSuccess: false,
-    authenticationSuccess: false,
-    diagnosis: 'not checked',
-    reason: '',
-    targetEmail: typeof targetEmail === 'string' ? targetEmail.trim() : ''
-  };
 
   try {
     await transporter.verify({ timeout: 20000 });
@@ -152,10 +324,12 @@ async function runSmtpDiagnostics(targetEmail) {
     const classification = classifySmtpError(err);
     diagnostics.connectionSuccess = false;
     diagnostics.authenticationSuccess = false;
+    diagnostics.cause = classification.cause;
     diagnostics.diagnosis = classification.diagnosis;
     diagnostics.reason = classification.reason;
     diagnostics.error = err?.message || String(err);
     diagnostics.errorCode = err?.code || null;
+    diagnostics.errorCommand = err?.command || null;
   }
 
   return diagnostics;
@@ -251,6 +425,275 @@ async function persistReview(review) {
   }
 }
 
+// In-memory chat persistence fallback
+const chatConversationsStore = new Map();
+const chatMessagesStore = new Map();
+
+// In-memory fallback store for order files when Supabase is not configured
+const orderFilesStore = new Map();
+
+function normalizeOrderFile(record) {
+  const now = new Date().toISOString();
+  return {
+    id: String(record.id || crypto.randomUUID()),
+    order_id: String(record.order_id),
+    file_name: record.file_name || record.name || 'file',
+    storage_path: record.storage_path || null,
+    bucket_name: record.bucket_name || 'order-deliveries',
+    mime_type: record.mime_type || record.contentType || null,
+    file_size: typeof record.file_size === 'number' ? record.file_size : (record.file_size ? Number(record.file_size) : null),
+    version_label: record.version_label || record.version || null,
+    uploaded_by: record.uploaded_by || null,
+    uploaded_at: record.uploaded_at || now,
+    delivery_status: record.delivery_status || 'Delivered',
+    notify_sent: Boolean(record.notify_sent || false),
+    metadata: record.metadata || null
+  };
+}
+
+async function persistOrderFile(fileRecord) {
+  const record = normalizeOrderFile(fileRecord);
+  if (!supabase) {
+    const files = orderFilesStore.get(record.order_id) || [];
+    files.push(record);
+    orderFilesStore.set(record.order_id, files);
+    return record;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_order_files').insert([record]).select();
+    if (error) {
+      console.error('Supabase persistOrderFile error:', error);
+      throw error;
+    }
+    if (Array.isArray(data) && data.length > 0) return data[0];
+    return record;
+  } catch (err) {
+    console.error('persistOrderFile exception:', err.message || err);
+    return record;
+  }
+}
+
+async function loadOrderFiles(orderId) {
+  if (!orderId) return [];
+  if (!supabase) {
+    return orderFilesStore.get(orderId) || [];
+  }
+  try {
+    const { data, error } = await supabase.from('matex_order_files').select('*').eq('order_id', orderId).order('uploaded_at', { ascending: false });
+    if (error) {
+      console.error('Supabase loadOrderFiles error:', error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('loadOrderFiles exception:', err.message || err);
+    return [];
+  }
+}
+
+async function createSignedUrlForFile(bucket, path, expiresSec = 3600) {
+  if (!supabase) return null;
+  try {
+    const { data, error } = await supabase.storage.from(bucket).createSignedUrl(path, expiresSec);
+    if (error) {
+      console.error('Supabase createSignedUrl error:', error);
+      return null;
+    }
+    // support both signedURL and signedUrl naming
+    return data?.signedUrl || data?.signedURL || null;
+  } catch (err) {
+    console.error('createSignedUrlForFile exception:', err.message || err);
+    return null;
+  }
+}
+
+function normalizeChatConversation(conversation) {
+  const now = new Date().toISOString();
+  return {
+    id: String(conversation.id || crypto.randomUUID()),
+    customer_name: conversation.customer_name || 'Guest',
+    customer_email: conversation.customer_email || null,
+    customer_phone: conversation.customer_phone || null,
+    subject: conversation.subject || 'New conversation',
+    status: conversation.status || 'open',
+    source: conversation.source || 'website',
+    order_id: conversation.order_id || null,
+    unread_admin_count: Number(conversation.unread_admin_count || 0),
+    unread_customer_count: Number(conversation.unread_customer_count || 0),
+    last_message_at: conversation.last_message_at || now,
+    created_at: conversation.created_at || now,
+    updated_at: conversation.updated_at || now
+  };
+}
+
+function normalizeChatMessage(message) {
+  const now = new Date().toISOString();
+  return {
+    id: String(message.id || crypto.randomUUID()),
+    conversation_id: String(message.conversation_id),
+    sender: String(message.sender || 'customer'),
+    sender_name: message.sender_name || (message.sender === 'admin' ? 'Admin' : 'Customer'),
+    sender_email: message.sender_email || null,
+    body: String(message.body || '').trim(),
+    metadata: message.metadata || null,
+    is_system: Boolean(message.is_system || false),
+    created_at: message.created_at || now
+  };
+}
+
+async function persistChatConversation(conversation) {
+  if (!conversation || !conversation.id) return conversation;
+  const record = normalizeChatConversation(conversation);
+  if (!supabase) {
+    chatConversationsStore.set(record.id, record);
+    return record;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_chat_conversations').upsert([record], { onConflict: 'id' }).select();
+    if (error) {
+      console.error('Supabase persistChatConversation error:', error);
+      throw error;
+    }
+    if (Array.isArray(data) && data.length > 0) {
+      return data[0];
+    }
+    return record;
+  } catch (err) {
+    console.error('persistChatConversation exception:', err.message || err);
+    return record;
+  }
+}
+
+async function persistChatMessage(message) {
+  if (!message || !message.conversation_id || !message.body) return message;
+  const record = normalizeChatMessage(message);
+  if (!supabase) {
+    const messages = chatMessagesStore.get(record.conversation_id) || [];
+    messages.push(record);
+    chatMessagesStore.set(record.conversation_id, messages);
+    return record;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_chat_messages').insert([record]).select();
+    if (error) {
+      console.error('Supabase persistChatMessage error:', error);
+      throw error;
+    }
+    if (Array.isArray(data) && data.length > 0) {
+      return data[0];
+    }
+    return record;
+  } catch (err) {
+    console.error('persistChatMessage exception:', err.message || err);
+    return record;
+  }
+}
+
+async function loadChatConversations() {
+  if (!supabase) {
+    return Array.from(chatConversationsStore.values()).sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
+  }
+  try {
+    const { data, error } = await supabase.from('matex_chat_conversations').select('*').order('last_message_at', { ascending: false });
+    if (error) {
+      console.error('Supabase loadChatConversations error:', error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('loadChatConversations exception:', err.message || err);
+    return [];
+  }
+}
+
+async function loadChatConversationById(conversationId) {
+  if (!conversationId) return null;
+  if (!supabase) {
+    return chatConversationsStore.get(conversationId) || null;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_chat_conversations').select('*').eq('id', conversationId).limit(1).maybeSingle();
+    if (error) {
+      console.error('Supabase loadChatConversationById error:', error);
+      return null;
+    }
+    return data || null;
+  } catch (err) {
+    console.error('loadChatConversationById exception:', err.message || err);
+    return null;
+  }
+}
+
+async function loadChatMessages(conversationId) {
+  if (!conversationId) return [];
+  if (!supabase) {
+    return (chatMessagesStore.get(conversationId) || []).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+  }
+  try {
+    const { data, error } = await supabase.from('matex_chat_messages').select('*').eq('conversation_id', conversationId).order('created_at', { ascending: true });
+    if (error) {
+      console.error('Supabase loadChatMessages error:', error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('loadChatMessages exception:', err.message || err);
+    return [];
+  }
+}
+
+async function updateChatConversation(conversationId, patch) {
+  if (!conversationId || !patch) return null;
+  const existing = await loadChatConversationById(conversationId);
+  if (!existing) return null;
+  const merged = Object.assign({}, existing, patch, { updated_at: new Date().toISOString() });
+  return persistChatConversation(merged);
+}
+
+function buildChatNotificationHtml(conversation, message, options = {}) {
+  const title = options.forAdmin ? 'New Live Chat Message' : 'Reply from Matex Team';
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 680px; margin: 0 auto; background: #f5f5f5; padding: 24px; border-radius: 12px;">
+      <h2 style="color: #8b0000; text-align: center;">${title}</h2>
+      <div style="background: white; padding: 20px; border-radius: 10px; margin-top: 18px;">
+        <p><strong>Conversation:</strong> ${conversation.subject || 'Live chat'}</p>
+        <p><strong>Customer:</strong> ${conversation.customer_name || 'Guest'}</p>
+        <p><strong>Email:</strong> ${conversation.customer_email || 'N/A'}</p>
+        <p><strong>Phone:</strong> ${conversation.customer_phone || 'N/A'}</p>
+        <hr style="margin: 16px 0; border-color: #eee;" />
+        <p style="white-space: pre-wrap;">${message.body}</p>
+      </div>
+      <p style="color: #666; font-size: 13px; margin-top: 20px;">This message was generated by the Matex live messaging system.</p>
+    </div>
+  `;
+}
+
+async function notifyAdminAboutNewChatMessage(conversation, message) {
+  if (!DESIGNER_EMAIL || !message || message.sender !== 'customer') return;
+  try {
+    await sendEmail(
+      DESIGNER_EMAIL,
+      `New chat message from ${conversation.customer_name || 'a customer'}`,
+      buildChatNotificationHtml(conversation, message, { forAdmin: true })
+    );
+  } catch (err) {
+    console.error('Admin chat notification failed:', err.message || err);
+  }
+}
+
+async function notifyCustomerAboutAdminReply(conversation, message) {
+  if (!conversation?.customer_email || !message || message.sender !== 'admin') return;
+  try {
+    await sendEmail(
+      conversation.customer_email,
+      `Reply from Matex — ${conversation.subject || 'Live chat'}`,
+      buildChatNotificationHtml(conversation, message, { forAdmin: false })
+    );
+  } catch (err) {
+    console.error('Customer chat notification failed:', err.message || err);
+  }
+}
+
 const SUPABASE_ORDER_FIELDS = [
   'order_id',
   'client_name',
@@ -258,12 +701,20 @@ const SUPABASE_ORDER_FIELDS = [
   'whatsapp_number',
   'service_name',
   'amount',
-  'payment_status',
-  'order_status',
-  'payment_reference',
+  'amount_paid',
+  'amount_remaining',
+  'payment_method',
   'payment_type',
+  'payment_status',
+  'payment_reference',
+  'payment_date',
+  'paid_at',
+  'download_access',
+  'order_status',
   'revision_count',
   'latest_progress',
+  'status_history',
+  'metadata',
   'design_description',
   'brand_name',
   'brand_color',
@@ -283,19 +734,32 @@ function getRevisionCount(paymentType) {
 
 function normalizeOrderRecord(order) {
   if (!order || !order.order_id) return null;
-  return {
+  const amount = typeof order.amount === 'number' ? order.amount : (Number(order.amount) || null);
+  const amountPaid = typeof order.amount_paid === 'number' ? order.amount_paid : (Number(order.amount_paid) || 0);
+  const paymentStatusNormalized = String(order.payment_status || order.paymentStatus || 'Pending').toUpperCase();
+  const paymentTypeValue = order.payment_type || order.paymentType || order.paymentMethod || null;
+  const isFullPayment = String(paymentTypeValue || '').toLowerCase().includes('full');
+
+  const record = {
     order_id: String(order.order_id),
     client_name: order.client_name || order.full_name || null,
     client_email: order.client_email || order.email || null,
     whatsapp_number: order.whatsapp_number || order.client_phone || order.phone || null,
     service_name: order.service_name || order.service || null,
-    amount: typeof order.amount === 'number' ? order.amount : (Number(order.amount) || null),
-    payment_type: order.payment_type || order.paymentMethod || null,
-    payment_status: order.payment_status || order.paymentStatus || 'Pending',
-    order_status: order.order_status || order.status || 'Pending',
+    amount,
+    amount_paid: amountPaid || 0,
+    amount_remaining: amount !== null ? Math.max(amount - amountPaid, 0) : (typeof order.amount_remaining === 'number' ? order.amount_remaining : null),
+    payment_method: order.payment_method || order.paymentMethod || null,
+    payment_type: paymentTypeValue,
+    payment_status: paymentStatusNormalized === 'FAILED' ? 'FAILED' : (paymentStatusNormalized === 'PAID' ? 'PAID' : 'Pending'),
     payment_reference: order.payment_reference || order.reference || null,
-    revision_count: typeof order.revision_count === 'number' ? order.revision_count : getRevisionCount(order.payment_type || order.paymentMethod),
+    payment_date: order.payment_date || order.paid_at || null,
+    paid_at: order.paid_at || order.payment_date || null,
+    download_access: paymentStatusNormalized === 'PAID' && isFullPayment,
+    order_status: order.order_status || order.status || 'Pending',
+    revision_count: typeof order.revision_count === 'number' ? order.revision_count : getRevisionCount(paymentTypeValue),
     latest_progress: order.latest_progress || order.status || 'Order created',
+    metadata: order.metadata || null,
     design_description: order.design_description || order.description || order.metadata?.design_description || null,
     brand_name: order.brand_name || order.brand || null,
     brand_color: order.brand_color || order.brand_colors || null,
@@ -305,6 +769,14 @@ function normalizeOrderRecord(order) {
     deadline: order.deadline || null,
     created_at: order.created_at || new Date().toISOString()
   };
+
+  if (Object.prototype.hasOwnProperty.call(order, 'status_history')) {
+    record.status_history = order.status_history;
+  } else if (Object.prototype.hasOwnProperty.call(order, 'statusHistory')) {
+    record.status_history = order.statusHistory;
+  }
+
+  return record;
 }
 
 function buildSupabaseOrderPayload(orderRecord) {
@@ -437,6 +909,30 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'Matex API healthy' });
 });
 
+/**
+ * GET /api/services
+ * Get list of all services with pricing
+ * Single source of truth for service pricing across the application
+ * 
+ * Returns:
+ * - services (array): List of available services with pricing in Naira and USD
+ */
+app.get('/api/services', (req, res) => {
+  const services = Object.values(SERVICE_PRICING).map(service => ({
+    name: service.name,
+    description: service.description,
+    priceNaira: service.naira,
+    priceUSD: service.usd,
+    currency: service.currency
+  }));
+  
+  res.json({
+    success: true,
+    services: services,
+    count: services.length
+  });
+});
+
 app.post('/api/admin/login', (req, res) => {
   console.log('📍 POST /api/admin/login - Admin login attempt');
   if (!ADMIN_PASSWORD || !ADMIN_SECRET_KEY) {
@@ -472,7 +968,7 @@ app.get('/api/admin/orders', adminAuth, async (req, res) => {
   console.log('📍 GET /api/admin/orders - Fetching all orders');
   try {
     if (supabase) {
-      const orderSelect = 'order_id, client_name, client_email, whatsapp_number, service_name, amount, payment_type, payment_status, order_status, revision_count, latest_progress, payment_reference, design_description, brand_name, brand_color, dob, deadline, reference_link, additional_note, created_at';
+      const orderSelect = 'order_id, client_name, client_email, whatsapp_number, service_name, amount, amount_paid, amount_remaining, payment_method, payment_type, payment_status, payment_reference, payment_date, paid_at, download_access, order_status, revision_count, latest_progress, status_history, design_description, brand_name, brand_color, dob, deadline, reference_link, additional_note, metadata, created_at';
       try {
         const { data, error } = await supabase
           .from('matex_orders')
@@ -518,17 +1014,43 @@ app.put('/api/admin/orders/:orderId', adminAuth, async (req, res) => {
     }
 
     const updatePayload = {};
+    let historyEntry = null;
     if (status) updatePayload.order_status = status;
-    if (typeof latest_progress !== 'undefined') updatePayload.latest_progress = latest_progress;
+    if (typeof latest_progress !== 'undefined') {
+      const progressText = String(latest_progress || '').trim() || 'Progress update';
+      updatePayload.latest_progress = progressText;
+      historyEntry = {
+        status: status || null,
+        message: progressText,
+        updated_at: new Date().toISOString()
+      };
+    }
 
     let updatedOrder = null;
     if (supabase) {
       // Only update fields that are known to exist in the Supabase schema
       const supaUpdate = {};
       if (updatePayload.order_status) supaUpdate.order_status = updatePayload.order_status;
-      if (typeof updatePayload.latest_progress !== 'undefined') supaUpdate.latest_progress = updatePayload.latest_progress;
+      if (typeof updatePayload.latest_progress !== 'undefined') {
+        supaUpdate.latest_progress = updatePayload.latest_progress;
+      }
 
       try {
+        let existing = null;
+        if (historyEntry) {
+          const existingRes = await supabase
+            .from('matex_orders')
+            .select('status_history')
+            .eq('order_id', orderId)
+            .limit(1)
+            .maybeSingle();
+          if (!existingRes.error && existingRes.data) {
+            existing = existingRes.data;
+          }
+          const existingHistory = Array.isArray(existing?.status_history) ? existing.status_history : [];
+          supaUpdate.status_history = [...existingHistory, historyEntry];
+        }
+
         const { data, error } = await supabase
           .from('matex_orders')
           .update(supaUpdate)
@@ -554,6 +1076,11 @@ app.put('/api/admin/orders/:orderId', adminAuth, async (req, res) => {
         return res.status(404).json({ success: false, message: 'Order not found' });
       }
       updatedOrder = Object.assign({}, existing, updatePayload);
+      if (historyEntry) {
+        updatedOrder.status_history = Array.isArray(existing.status_history)
+          ? [...existing.status_history, historyEntry]
+          : [historyEntry];
+      }
       orderStore.set(orderId, updatedOrder);
     }
 
@@ -633,6 +1160,457 @@ app.post('/api/admin/orders/:orderId/email', adminAuth, async (req, res) => {
 });
 
 /**
+ * POST /api/admin/orders/:orderId/files
+ * Admin uploads one or more files (base64 payloads) and links them to an order
+ * Body: { files: [{ file_name, mime_type, base64, version_label, file_size }], uploaded_by }
+ */
+app.post('/api/admin/orders/:orderId/files', adminAuth, upload.array('files'), async (req, res) => {
+  console.log(`📍 POST /api/admin/orders/${req.params.orderId}/files - Uploading files`);
+  try {
+    const orderId = String(req.params.orderId || '').trim();
+    const version_label = String(req.body.version_label || req.body.version || '').trim() || null;
+    const uploaded_by = String(req.body.uploaded_by || '').trim() || null;
+    let files = [];
+
+    if (Array.isArray(req.files) && req.files.length) {
+      files = req.files.map(file => ({
+        file_name: file.originalname,
+        mime_type: file.mimetype || 'application/octet-stream',
+        buffer: file.buffer,
+        file_size: Number(file.size || 0),
+        version_label
+      }));
+    } else {
+      const bodyFiles = Array.isArray(req.body.files) ? req.body.files : [];
+      files = bodyFiles.map(f => ({
+        file_name: String(f.file_name || f.name || 'file').trim(),
+        mime_type: f.mime_type || f.contentType || 'application/octet-stream',
+        base64: String(f.base64 || '').trim(),
+        file_size: typeof f.file_size === 'number' ? f.file_size : (f.file_size ? Number(f.file_size) : null),
+        version_label: String(f.version_label || f.version || version_label || '').trim() || null
+      }));
+    }
+
+    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+    if (!Array.isArray(files) || files.length === 0) return res.status(400).json({ success: false, message: 'At least one file is required' });
+
+    const bucket = 'order-deliveries';
+    const uploadedRecords = [];
+
+    for (const f of files) {
+      const name = String(f.file_name || 'file').trim();
+      const mime = f.mime_type || 'application/octet-stream';
+      const version_label_value = String(f.version_label || version_label || '').trim() || null;
+      const fileSize = typeof f.file_size === 'number' ? f.file_size : (f.file_size ? Number(f.file_size) : null);
+      const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const timestamp = Date.now();
+      const storagePath = `${orderId}/${timestamp}_${safeName}`;
+      let buffer = null;
+
+      if (f.buffer && Buffer.isBuffer(f.buffer)) {
+        buffer = f.buffer;
+      } else if (f.base64) {
+        try {
+          buffer = Buffer.from(f.base64, 'base64');
+        } catch (err) {
+          buffer = null;
+        }
+      }
+      if (!buffer) {
+        console.warn('Skipping file upload because content could not be parsed:', name);
+        continue;
+      }
+
+      // Upload to Supabase storage if configured
+      if (supabase) {
+        try {
+          const { data: uploadData, error: uploadError } = await supabase.storage.from(bucket).upload(storagePath, buffer, { contentType: mime, upsert: true });
+          if (uploadError) {
+            console.error('Supabase storage upload error for', storagePath, uploadError);
+          }
+        } catch (err) {
+          console.error('Supabase upload exception for', storagePath, err.message || err);
+        }
+      }
+
+      const record = await persistOrderFile({
+        order_id: orderId,
+        file_name: name,
+        storage_path: storagePath,
+        bucket_name: bucket,
+        mime_type: mime,
+        file_size: fileSize,
+        version_label: version_label_value,
+        uploaded_by,
+        uploaded_at: new Date().toISOString()
+      });
+
+      uploadedRecords.push(record);
+    }
+
+    // Append delivery history to order and notify customer
+    try {
+      if (supabase) {
+        const existingRes = await supabase.from('matex_orders').select('status_history, client_email').eq('order_id', orderId).limit(1).maybeSingle();
+        let existing = existingRes && !existingRes.error ? existingRes.data || null : null;
+        const existingHistory = Array.isArray(existing?.status_history) ? existing.status_history : [];
+        const entry = { status: 'Files Delivered', message: `Admin uploaded ${uploadedRecords.length} file(s)`, uploaded_at: new Date().toISOString() };
+        const newHistory = [...existingHistory, entry];
+        await supabase.from('matex_orders').update({ status_history: newHistory, latest_progress: 'Files uploaded by admin' }).eq('order_id', orderId);
+
+        const clientEmail = existing?.client_email || null;
+        if (clientEmail) {
+          await sendEmail(clientEmail, `Files uploaded for ${orderId}`, buildCustomerNotificationHtml({ order_id: orderId, client_name: '', client_email: clientEmail, latest_progress: 'Files uploaded by admin' }, `Admin uploaded ${uploadedRecords.length} file(s). Please check your project files.`));
+        }
+      } else {
+        // in-memory order store fallback
+        const existing = orderStore.get(orderId) || {};
+        const existingHistory = Array.isArray(existing.status_history) ? existing.status_history : [];
+        const entry = { status: 'Files Delivered', message: `Admin uploaded ${uploadedRecords.length} file(s)`, uploaded_at: new Date().toISOString() };
+        existing.status_history = [...existingHistory, entry];
+        existing.latest_progress = 'Files uploaded by admin';
+        orderStore.set(orderId, existing);
+        if (existing.client_email) {
+          await sendEmail(existing.client_email, `Files uploaded for ${orderId}`, buildCustomerNotificationHtml({ order_id: orderId, client_email: existing.client_email }, `Admin uploaded ${uploadedRecords.length} file(s).`));
+        }
+      }
+    } catch (notifyErr) {
+      console.error('Order history update / notification failed:', notifyErr.message || notifyErr);
+    }
+
+    return res.json({ success: true, files: uploadedRecords });
+  } catch (err) {
+    console.error('Admin upload files error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to upload files' });
+  }
+});
+
+/**
+ * GET /api/admin/orders/:orderId/files
+ * Admin listing of uploaded files for an order
+ */
+app.get('/api/admin/orders/:orderId/files', adminAuth, async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || '').trim();
+    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+    const files = await loadOrderFiles(orderId);
+    return res.json({ success: true, files });
+  } catch (err) {
+    console.error('Admin list order files error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load files' });
+  }
+});
+
+/**
+ * GET /api/orders/:orderId/files
+ * Customer-facing listing of project files and delivery status
+ */
+app.get('/api/orders/:orderId/files', async (req, res) => {
+  try {
+    const orderId = String(req.params.orderId || '').trim();
+    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+    // Load order to determine download access rules
+    let order = null;
+    if (supabase) {
+      const ordRes = await supabase.from('matex_orders').select('*').eq('order_id', orderId).limit(1).maybeSingle();
+      if (!ordRes.error) order = ordRes.data || null;
+    }
+    if (!order) order = orderStore.get(orderId) || null;
+
+    const files = await loadOrderFiles(orderId);
+    const isDownloadAllowed = Boolean(order && order.download_access);
+
+    const mapped = await Promise.all(files.map(async f => {
+      const downloadAllowed = isDownloadAllowed;
+      let download_url = null;
+      if (downloadAllowed && supabase && f.storage_path) {
+        download_url = await createSignedUrlForFile(f.bucket_name || 'order-deliveries', f.storage_path, 3600);
+      }
+      return Object.assign({}, f, { download_allowed: downloadAllowed, download_url });
+    }));
+
+    return res.json({ success: true, files: mapped, download_access: isDownloadAllowed });
+  } catch (err) {
+    console.error('Customer list order files error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load files' });
+  }
+});
+
+/**
+ * GET /api/orders/:orderId/files/:fileId/download
+ * Generate a signed download URL for a specific file if allowed
+ */
+app.get('/api/orders/:orderId/files/:fileId/download', async (req, res) => {
+  try {
+    const { orderId, fileId } = req.params;
+    if (!orderId || !fileId) return res.status(400).json({ success: false, message: 'orderId and fileId are required' });
+
+    let order = null;
+    if (supabase) {
+      const ordRes = await supabase.from('matex_orders').select('*').eq('order_id', orderId).limit(1).maybeSingle();
+      if (!ordRes.error) order = ordRes.data || null;
+    }
+    if (!order) order = orderStore.get(orderId) || null;
+
+    const files = await loadOrderFiles(orderId);
+    const file = (files || []).find(x => String(x.id) === String(fileId));
+    if (!file) return res.status(404).json({ success: false, message: 'File not found' });
+
+    const isDownloadAllowed = Boolean(order && order.download_access);
+    if (!isDownloadAllowed) {
+      return res.status(403).json({ success: false, message: 'Complete payment to download', download_allowed: false });
+    }
+
+    if (!supabase) return res.status(500).json({ success: false, message: 'Storage not configured' });
+    const url = await createSignedUrlForFile(file.bucket_name || 'order-deliveries', file.storage_path, 60 * 60);
+    if (!url) return res.status(500).json({ success: false, message: 'Unable to generate download URL' });
+    return res.json({ success: true, download_url: url });
+  } catch (err) {
+    console.error('Generate download url error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to generate download URL' });
+  }
+});
+
+// Admin download: generate signed URL for a file regardless of payment rules
+app.get('/api/admin/orders/:orderId/files/:fileId/download', adminAuth, async (req, res) => {
+  try {
+    const { orderId, fileId } = req.params;
+    if (!orderId || !fileId) return res.status(400).json({ success: false, message: 'orderId and fileId are required' });
+    const files = await loadOrderFiles(orderId);
+    const file = (files || []).find(x => String(x.id) === String(fileId));
+    if (!file) return res.status(404).json({ success: false, message: 'File not found' });
+    if (!supabase) return res.status(500).json({ success: false, message: 'Storage not configured' });
+    const url = await createSignedUrlForFile(file.bucket_name || 'order-deliveries', file.storage_path, 60 * 60);
+    if (!url) return res.status(500).json({ success: false, message: 'Unable to generate download URL' });
+    return res.json({ success: true, download_url: url });
+  } catch (err) {
+    console.error('Admin generate download url error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to generate download URL' });
+  }
+});
+
+app.post('/api/chat/conversations', async (req, res) => {
+  console.log('📍 POST /api/chat/conversations - Creating a new conversation');
+  try {
+    const { customer_name, customer_email, customer_phone, subject, initial_message } = req.body || {};
+    if (!initial_message || !String(initial_message).trim()) {
+      return res.status(400).json({ success: false, message: 'Initial message is required.' });
+    }
+
+    const conversation = await persistChatConversation({
+      customer_name: String(customer_name || 'Guest'),
+      customer_email: customer_email ? String(customer_email).trim() : null,
+      customer_phone: customer_phone ? String(customer_phone).trim() : null,
+      subject: String(subject || 'Live chat inquiry'),
+      status: 'open',
+      source: 'website',
+      unread_admin_count: 1,
+      last_message_at: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    });
+
+    const message = await persistChatMessage({
+      conversation_id: conversation.id,
+      sender: 'customer',
+      sender_name: conversation.customer_name,
+      sender_email: conversation.customer_email,
+      body: String(initial_message).trim(),
+      is_system: false
+    });
+
+    await notifyAdminAboutNewChatMessage(conversation, message);
+
+    return res.json({ success: true, conversation, message });
+  } catch (err) {
+    console.error('Create conversation error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to create conversation.' });
+  }
+});
+
+app.get('/api/chat/conversations/:conversationId', async (req, res) => {
+  console.log(`📍 GET /api/chat/conversations/${req.params.conversationId} - Fetching conversation`);
+  try {
+    const conversation = await loadChatConversationById(String(req.params.conversationId).trim());
+    if (!conversation) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+    const messages = await loadChatMessages(conversation.id);
+    return res.json({ success: true, conversation, messages });
+  } catch (err) {
+    console.error('Fetch conversation error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to fetch conversation.' });
+  }
+});
+
+app.post('/api/chat/conversations/:conversationId/messages', async (req, res) => {
+  console.log(`📍 POST /api/chat/conversations/${req.params.conversationId}/messages - Adding chat message`);
+  try {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const { sender = 'customer', sender_name, sender_email, body } = req.body || {};
+    if (!conversationId) {
+      return res.status(400).json({ success: false, message: 'Conversation id is required.' });
+    }
+    if (!body || !String(body).trim()) {
+      return res.status(400).json({ success: false, message: 'Message body is required.' });
+    }
+
+    const conversation = await loadChatConversationById(conversationId);
+    if (!conversation) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+
+    const message = await persistChatMessage({
+      conversation_id: conversationId,
+      sender: String(sender),
+      sender_name: String(sender_name || (sender === 'admin' ? 'Admin' : conversation.customer_name || 'Customer')), 
+      sender_email: sender_email || (sender === 'customer' ? conversation.customer_email : null),
+      body: String(body).trim(),
+      is_system: false
+    });
+
+    const updatePatch = {
+      updated_at: new Date().toISOString(),
+      last_message_at: new Date().toISOString()
+    };
+    if (message.sender === 'customer') {
+      updatePatch.unread_admin_count = Number(conversation.unread_admin_count || 0) + 1;
+    } else if (message.sender === 'admin') {
+      updatePatch.unread_customer_count = Number(conversation.unread_customer_count || 0) + 1;
+    }
+
+    const updatedConversation = await updateChatConversation(conversationId, updatePatch);
+
+    if (message.sender === 'customer') {
+      await notifyAdminAboutNewChatMessage(updatedConversation || conversation, message);
+    }
+    if (message.sender === 'admin') {
+      await notifyCustomerAboutAdminReply(updatedConversation || conversation, message);
+    }
+
+    return res.json({ success: true, conversation: updatedConversation, message });
+  } catch (err) {
+    console.error('Add chat message error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to add message.' });
+  }
+});
+
+app.get('/api/admin/chat/conversations', adminAuth, async (req, res) => {
+  console.log('📍 GET /api/admin/chat/conversations - Listing conversations');
+  try {
+    const conversations = await loadChatConversations();
+    return res.json({ success: true, conversations });
+  } catch (err) {
+    console.error('Admin load conversations error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load conversations.' });
+  }
+});
+
+app.get('/api/admin/chat/conversations/:conversationId/messages', adminAuth, async (req, res) => {
+  console.log(`📍 GET /api/admin/chat/conversations/${req.params.conversationId}/messages - Loading messages`);
+  try {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const messages = await loadChatMessages(conversationId);
+    return res.json({ success: true, messages });
+  } catch (err) {
+    console.error('Admin conversation messages error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load messages.' });
+  }
+});
+
+app.post('/api/admin/chat/conversations/:conversationId/messages', adminAuth, async (req, res) => {
+  console.log(`📍 POST /api/admin/chat/conversations/${req.params.conversationId}/messages - Admin reply`);
+  try {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const { body, sender_name } = req.body || {};
+    if (!conversationId || !body || !String(body).trim()) {
+      return res.status(400).json({ success: false, message: 'Conversation id and body are required.' });
+    }
+    const conversation = await loadChatConversationById(conversationId);
+    if (!conversation) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+
+    const message = await persistChatMessage({
+      conversation_id: conversationId,
+      sender: 'admin',
+      sender_name: String(sender_name || 'Admin'),
+      sender_email: DESIGNER_EMAIL || null,
+      body: String(body).trim(),
+      is_system: false
+    });
+
+    const updatedConversation = await updateChatConversation(conversationId, {
+      last_message_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      unread_customer_count: Number(conversation.unread_customer_count || 0) + 1
+    });
+
+    await notifyCustomerAboutAdminReply(updatedConversation || conversation, message);
+    return res.json({ success: true, conversation: updatedConversation, message });
+  } catch (err) {
+    console.error('Admin reply error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to post admin reply.' });
+  }
+});
+
+app.put('/api/admin/chat/conversations/:conversationId/status', adminAuth, async (req, res) => {
+  console.log(`📍 PUT /api/admin/chat/conversations/${req.params.conversationId}/status - Updating status`);
+  try {
+    const conversationId = String(req.params.conversationId || '').trim();
+    const { status } = req.body || {};
+    if (!conversationId || !status || !['open', 'closed', 'pending'].includes(String(status))) {
+      return res.status(400).json({ success: false, message: 'Valid status is required.' });
+    }
+    const conversation = await loadChatConversationById(conversationId);
+    if (!conversation) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+    const updatedConversation = await updateChatConversation(conversationId, { status: String(status), updated_at: new Date().toISOString() });
+    return res.json({ success: true, conversation: updatedConversation });
+  } catch (err) {
+    console.error('Update conversation status error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to update conversation status.' });
+  }
+});
+
+app.post('/api/assistant/query', async (req, res) => {
+  console.log('📍 POST /api/assistant/query - Assistant query received');
+  try {
+    const { query } = req.body || {};
+    if (!query || !String(query).trim()) {
+      return res.status(400).json({ success: false, message: 'Query text is required.' });
+    }
+
+    const normalized = String(query).trim().toLowerCase();
+    const response = {
+      text: 'I can help with templates, ordering, or live chat. Ask me to show examples or prefill an order request.',
+      suggestions: ['Show Flyer templates', 'Guide me to order a Logo', 'Open Live DM'],
+      actions: []
+    };
+
+    if (/(flyer|flyers|flyer templates)/.test(normalized)) {
+      response.text = 'I recommend starting with our Flyer templates. Search by category or ask me for design options.';
+      response.suggestions = ['Show Flyer templates', 'Show Logo templates', 'Guide me to order a Flyer'];
+    } else if (/(logo|logos|logo templates)/.test(normalized)) {
+      response.text = 'I can show you logo templates and help place a customization order.';
+      response.suggestions = ['Show Logo templates', 'Open Live DM', 'Order a Logo design'];
+    } else if (/(video|reel|youtube|endscreen)/.test(normalized)) {
+      response.text = 'Video templates are available for reels, intros, and ads. Tell me the style you need.';
+      response.suggestions = ['Show Video templates', 'Guide me to order a video', 'Open Live DM'];
+    } else if (/order|customize|customization|package/.test(normalized)) {
+      response.text = 'I can prefill a live DM for you, open WhatsApp, or create an order request. What would you like?';
+      response.actions = [{ type: 'open_live_dm', label: 'Open Live DM' }];
+    }
+
+    return res.json({ success: true, assistant: response });
+  } catch (err) {
+    console.error('Assistant query error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to process query.' });
+  }
+});
+
+/**
  * POST /api/payment/initialize
  * Initialize Paystack transaction
  * 
@@ -686,6 +1664,7 @@ app.post('/api/payment/initialize', async (req, res) => {
     if (callback_url) {
       initializePayload.callback_url = callback_url;
     }
+    console.log('🔧 Paystack initialize payload:', JSON.stringify(initializePayload));
 
     const response = await axios.post(
       `${PAYSTACK_API_URL}/transaction/initialize`,
@@ -700,13 +1679,25 @@ app.post('/api/payment/initialize', async (req, res) => {
 
     if (response.data.status) {
       const payload = response.data.data;
+      console.log('🔔 Paystack initialize response:', {
+        reference: payload.reference,
+        access_code: payload.access_code,
+        authorization_url: payload.authorization_url
+      });
       const existingOrder = orderStore.get(order_id) || {};
       const orderData = Object.assign({}, existingOrder, {
         order_id,
         email,
         amount: amountInKobo / 100,
         service_name,
+        payment_method: 'Paystack',
         payment_type,
+        amount_paid: 0,
+        amount_remaining: amountInKobo / 100,
+        payment_reference: payload.reference,
+        payment_date: null,
+        paid_at: null,
+        download_access: false,
         reference: payload.reference,
         access_code: payload.access_code,
         authorization_url: payload.authorization_url,
@@ -714,12 +1705,13 @@ app.post('/api/payment/initialize', async (req, res) => {
         payment_status: 'Pending',
         // New orders must default to Pending for order lifecycle consistency
         order_status: 'Pending',
-        latest_progress: 'Payment initialized and awaiting admin confirmation',
+        latest_progress: 'Payment initialized and awaiting completion',
         created_at: existingOrder.created_at || new Date().toISOString()
       });
       orderStore.set(payload.reference, orderData);
       orderStore.set(order_id, orderData);
       await persistOrder(orderData);
+      console.log('✅ Payment initialization persisted for order:', order_id, 'reference:', payload.reference);
 
       return res.json({
         success: true,
@@ -794,14 +1786,17 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
     const orderId = String(metadata.order_id || '').trim() || null;
     const storedOrder = orderStore.get(transaction.reference) || (orderId ? orderStore.get(orderId) : null);
     const finalOrderId = orderId || storedOrder?.order_id || storedOrder?.id || transaction.reference;
-    const paymentTypeRaw = metadata.payment_type || storedOrder?.payment_type || storedOrder?.paymentMethod || 'Unknown';
+    const paymentTypeRaw = metadata.payment_type || storedOrder?.payment_type || storedOrder?.paymentType || storedOrder?.paymentMethod || 'Unknown';
     const isSuccess = String(transaction.status || '').toLowerCase() === 'success';
-    const isDeposit = String(paymentTypeRaw).toLowerCase().includes('deposit') || String(paymentTypeRaw).toLowerCase().includes('50%');
-
-    const paymentStatus = isSuccess ? (isDeposit ? 'Partial' : 'PAID') : String(transaction.status || 'Pending');
-    // IMPORTANT: business rule — orders should remain in 'Pending' lifecycle until admin confirms
-    const orderStatus = 'Pending';
+    const amountPaid = Number(transaction.amount || 0) / 100;
+    const paymentDate = transaction.paid_at || transaction.created_at || new Date().toISOString();
+    const paymentStatus = isSuccess ? 'PAID' : (String(transaction.status || '').toLowerCase() === 'failed' ? 'FAILED' : 'Pending');
+    const orderStatus = isSuccess ? 'Payment Verified' : (String(transaction.status || '').toLowerCase() === 'failed' ? 'Failed' : 'Pending');
     const revisionCount = getRevisionCount(paymentTypeRaw);
+    const amountRemaining = typeof storedOrder?.amount === 'number'
+      ? Math.max(storedOrder.amount - amountPaid, 0)
+      : 0;
+    const downloadAccess = paymentStatus === 'PAID' && String(paymentTypeRaw || '').toLowerCase().includes('full');
 
     const updatedOrder = {
       order_id: finalOrderId,
@@ -816,17 +1811,22 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
       deadline: storedOrder?.deadline || metadata.deadline || null,
       reference_link: storedOrder?.reference_link || metadata.reference_link || null,
       additional_note: storedOrder?.additional_note || metadata.additional_note || metadata.additional_notes || null,
-      amount: transaction.amount / 100,
+      amount: storedOrder?.amount ?? (transaction.amount / 100),
+      amount_paid: amountPaid,
+      amount_remaining: amountRemaining,
+      payment_method: 'Paystack',
       payment_type: paymentTypeRaw,
       payment_status: paymentStatus,
-      order_status: orderStatus,
       payment_reference: transaction.reference,
+      payment_date: paymentDate,
+      paid_at: paymentDate,
+      download_access: downloadAccess,
+      order_status: orderStatus,
       status: orderStatus,
       revision_count: revisionCount,
-      latest_progress: isSuccess ? (isDeposit ? 'Deposit payment received — awaiting admin confirmation' : 'Payment received — awaiting admin confirmation') : `Payment ${transaction.status || 'pending'}`,
+      latest_progress: isSuccess ? 'Payment received — awaiting admin confirmation' : `Payment ${transaction.status || 'pending'}`,
       email: transaction.customer?.email || storedOrder?.email || null,
       customer_id: transaction.customer?.id || storedOrder?.customer_id || null,
-      paid_at: transaction.paid_at,
       created_at: storedOrder?.created_at || transaction.created_at || new Date().toISOString(),
       metadata
     };
@@ -837,6 +1837,7 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
     }
 
     await persistOrder(updatedOrder);
+    console.log('✅ Payment verification persisted for reference:', transaction.reference, 'order_id:', finalOrderId, 'status:', paymentStatus);
 
     if (isSuccess) {
       try {
@@ -910,6 +1911,121 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
 });
 
 /**
+ * POST /api/payment/webhook
+ * Paystack webhook receiver (expects raw body for signature verification)
+ */
+app.post('/api/payment/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  console.log('📍 POST /api/payment/webhook - Webhook received');
+  try {
+    const signature = String(req.headers['x-paystack-signature'] || req.headers['X-Paystack-Signature'] || '');
+    // Support both raw Buffer (when express.raw runs) and parsed JSON (when express.json runs)
+    let rawForSig = null;
+    if (Buffer.isBuffer(req.body)) {
+      rawForSig = req.body;
+    } else if (typeof req.body === 'string') {
+      rawForSig = Buffer.from(req.body, 'utf8');
+    } else {
+      rawForSig = Buffer.from(JSON.stringify(req.body), 'utf8');
+    }
+
+    // Verify signature
+    const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(rawForSig).digest('hex');
+    if (!signature || signature !== expected) {
+      console.warn('⚠️ Invalid Paystack signature');
+      return res.status(400).send('invalid signature');
+    }
+
+    const event = (Buffer.isBuffer(req.body) || typeof req.body === 'string') ? JSON.parse(rawForSig.toString('utf8')) : req.body;
+    console.log('🔔 Paystack webhook event:', event.event || '(no event)', 'reference:', event.data?.reference || 'n/a');
+
+    const data = event.data || {};
+    const reference = String(data.reference || '');
+    const metadata = data.metadata || {};
+    const orderId = (metadata.order_id || metadata.orderId || '').trim() || null;
+    const statusRaw = String(data.status || event.event || '').toLowerCase();
+    const isSuccess = statusRaw.includes('success') || statusRaw === 'success' || String(event.event || '').toLowerCase() === 'charge.success';
+    const amountPaid = Number(data.amount || data.paid_amount || 0) / 100;
+    const paidAt = data.paid_at || data.created_at || new Date().toISOString();
+    const paymentTypeRaw = metadata.payment_type || null;
+    const paymentStatus = isSuccess ? 'PAID' : (statusRaw === 'failed' ? 'FAILED' : 'Pending');
+    const orderStatus = isSuccess ? 'Payment Verified' : (statusRaw === 'failed' ? 'Failed' : 'Pending');
+    const downloadAccess = paymentStatus === 'PAID' && String(paymentTypeRaw || '').toLowerCase().includes('full');
+
+    // Build update payload reusing existing columns
+    const updatePayload = {
+      amount: isNaN(amountPaid) ? null : amountPaid,
+      amount_paid: isNaN(amountPaid) ? null : amountPaid,
+      amount_remaining: null,
+      payment_method: 'Paystack',
+      payment_type: paymentTypeRaw || 'Unknown',
+      payment_status: paymentStatus,
+      order_status: orderStatus,
+      payment_reference: reference,
+      payment_date: paidAt,
+      paid_at: paidAt,
+      download_access: downloadAccess,
+      latest_progress: isSuccess ? 'Payment received via Paystack webhook' : `Payment ${statusRaw}`,
+      metadata: Object.assign({}, metadata, { raw_event: event })
+    };
+
+    console.log('🔄 Webhook processing payload:', { orderId, reference, amountPaid, paymentStatus });
+
+    // Persist to Supabase (prefer order_id, else fallback to payment_reference)
+    try {
+      let existing = null;
+      if (supabase) {
+        try {
+          if (orderId) {
+            const lookup = await supabase.from('matex_orders').select('*').eq('order_id', orderId).limit(1).maybeSingle();
+            if (!lookup.error) existing = lookup.data || null;
+          }
+          if (!existing && reference) {
+            const lookup2 = await supabase.from('matex_orders').select('*').eq('payment_reference', reference).limit(1).maybeSingle();
+            if (!lookup2.error) existing = lookup2.data || null;
+          }
+        } catch (lookupErr) {
+          console.warn('Supabase lookup warning during webhook:', lookupErr.message || lookupErr);
+        }
+
+        const merged = Object.assign({}, existing || {}, updatePayload);
+        if (typeof merged.amount === 'number' && typeof merged.amount_paid === 'number') {
+          merged.amount_remaining = Math.max(merged.amount - merged.amount_paid, 0);
+        }
+        if (!merged.order_id) merged.order_id = orderId || reference || merged.order_id || reference;
+
+        // Use upsert to avoid duplicate inserts; onConflict: order_id
+        const { data: upserted, error: upsertErr } = await supabase.from('matex_orders').upsert([merged], { onConflict: 'order_id' }).select();
+        if (upsertErr) {
+          console.error('❌ Supabase upsert error (webhook):', upsertErr);
+        } else {
+          console.log('✅ Supabase upsert (webhook) completed for:', merged.order_id || reference);
+        }
+      }
+
+      // Update in-memory store for immediate admin/dashboard visibility
+      const inMemKey = orderId || reference;
+      const existingMem = orderStore.get(inMemKey) || {};
+      const mergedMem = Object.assign({}, existingMem, updatePayload, { order_id: orderId || existingMem.order_id || reference });
+      if (typeof mergedMem.amount === 'number' && typeof mergedMem.amount_paid === 'number') {
+        mergedMem.amount_remaining = Math.max(mergedMem.amount - mergedMem.amount_paid, 0);
+      }
+      orderStore.set(inMemKey, mergedMem);
+      if (reference && inMemKey !== reference) orderStore.set(reference, mergedMem);
+
+      console.log('✅ In-memory orderStore updated (webhook):', inMemKey);
+    } catch (dbErr) {
+      console.error('❌ Error persisting webhook update:', dbErr.message || dbErr);
+    }
+
+    // Acknowledge webhook quickly
+    res.status(200).send('ok');
+  } catch (err) {
+    console.error('❌ Webhook processing error:', err && (err.message || err));
+    try { res.status(500).send('error'); } catch(e){}
+  }
+});
+
+/**
  * GET /api/orders/track/:orderId
  * Query Supabase orders table (preferred) and fallback to in-memory store
  */
@@ -923,17 +2039,17 @@ async function trackOrderHandler(req, res) {
 
   if (supabase) {
     try {
-      const orderSelect = 'order_id, client_name, client_email, whatsapp_number, service_name, amount, payment_type, payment_status, order_status, revision_count, latest_progress, payment_reference, design_description, brand_name, brand_color, dob, deadline, reference_link, additional_note, created_at';
-      const result = await supabase
-        .from('matex_orders')
+        const orderSelect = 'order_id, client_name, client_email, whatsapp_number, service_name, amount, amount_paid, amount_remaining, payment_method, payment_type, payment_status, payment_reference, payment_date, paid_at, download_access, order_status, revision_count, latest_progress, status_history, design_description, brand_name, brand_color, dob, deadline, reference_link, additional_note, metadata, created_at';
+        const result = await supabase.from('matex_orders')
         .select(orderSelect)
         .eq('order_id', normalizedOrderId)
-        .limit(1);
+        .limit(1)
+        .maybeSingle();
 
       if (result.error) {
         console.error('Supabase query error:', result.error);
-      } else if (result.data && result.data.length > 0) {
-        return res.json({ success: true, order: result.data[0] });
+      } else if (result.data) {
+        return res.json({ success: true, order: result.data });
       }
     } catch (err) {
       console.error('Track order error:', err.message || err);
@@ -980,20 +2096,28 @@ app.post('/api/orders/brief', async (req, res) => {
       return res.status(400).json({ success: false, message: 'order_id is required' });
     }
 
+    const amountValue = typeof payload.amount === 'number' ? payload.amount : (Number(payload.amount) || null);
+    const amountPaidValue = typeof payload.amount_paid === 'number' ? payload.amount_paid : 0;
     const upsertData = {
       order_id,
       client_name: payload.client_name || payload.full_name || null,
       client_email: payload.client_email || payload.email || null,
       whatsapp_number: payload.whatsapp_number || payload.client_phone || payload.phone || null,
       service_name: payload.service_name || payload.service || null,
-      payment_type: payload.payment_type || payload.paymentMethod || null,
+      payment_method: payload.payment_method || payload.paymentMethod || null,
+      payment_type: payload.payment_type || null,
       payment_status: payload.payment_status || 'Pending',
+      amount: amountValue,
+      amount_paid: amountPaidValue,
+      amount_remaining: amountValue !== null ? Math.max(amountValue - amountPaidValue, 0) : null,
+      payment_reference: payload.payment_reference || null,
+      payment_date: payload.payment_date || payload.paid_at || null,
+      paid_at: payload.paid_at || payload.payment_date || null,
+      download_access: false,
       // Ensure new briefs still set lifecycle to Pending until admin confirmation
       order_status: payload.order_status || 'Pending',
       latest_progress: payload.latest_progress || 'Brief submitted',
       revision_count: typeof payload.revision_count === 'number' ? payload.revision_count : getRevisionCount(payload.payment_type || payload.paymentMethod),
-      amount: typeof payload.amount === 'number' ? payload.amount : (Number(payload.amount) || null),
-      payment_reference: payload.payment_reference || null,
       design_description: payload.design_description || payload.description || null,
       brand_name: payload.brand_name || payload.brand || null,
       brand_color: payload.brand_color || payload.brand_colors || null,
@@ -1050,7 +2174,7 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
       try {
         const { data: existingData, error: existingError } = await supabase
           .from('matex_orders')
-          .select('order_status, latest_progress, client_email, service_name, order_id')
+          .select('order_status, latest_progress, status_history, client_email, service_name, order_id')
           .eq('order_id', orderId)
           .limit(1)
           .single();
@@ -1062,13 +2186,14 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
         console.warn('Supabase existing order fetch warning:', err.message || err);
       }
 
-      const previousProgress = existingOrder?.latest_progress ? String(existingOrder.latest_progress).trim() : '';
-      const newProgress = previousProgress ? `${previousProgress}\n${statusNote}` : statusNote;
+      const existingHistory = Array.isArray(existingOrder?.status_history) ? existingOrder.status_history : [];
+      const newHistoryEntry = { status, message: statusNote, updated_at: new Date().toISOString() };
+      const updatedHistory = [...existingHistory, newHistoryEntry];
 
       try {
         const { data, error } = await supabase
           .from('matex_orders')
-          .update({ order_status: status, latest_progress: newProgress })
+          .update({ order_status: status, latest_progress: statusNote, status_history: updatedHistory })
           .eq('order_id', orderId)
           .select()
           .limit(1)
@@ -1091,14 +2216,15 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
       if (!order) {
         return res.status(404).json({ success: false, message: 'Order not found' });
       }
-      const existingProgress = order.latest_progress ? String(order.latest_progress).trim() : '';
-      const newProgress = existingProgress ? `${existingProgress}\n${statusNote}` : statusNote;
+      const newHistoryEntry = { status, message: statusNote, updated_at: new Date().toISOString() };
       updatedOrder = {
         ...order,
         status,
         order_status: status,
-        latest_progress: newProgress,
-        status_history: Array.isArray(order.status_history) ? [...order.status_history, { status, message: statusNote, updated_at: new Date().toISOString() }] : [{ status, message: statusNote, updated_at: new Date().toISOString() }]
+        latest_progress: statusNote,
+        status_history: Array.isArray(order.status_history)
+          ? [...order.status_history, newHistoryEntry]
+          : [newHistoryEntry]
       };
       orderStore.set(orderId, updatedOrder);
     }
@@ -1120,6 +2246,7 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
       status,
       order_status: status,
       latest_progress: updatedOrder?.latest_progress || statusNote,
+      status_history: Array.isArray(updatedOrder?.status_history) ? updatedOrder.status_history : [],
       updated_at: updatedOrder?.updated_at || new Date().toISOString()
     };
 
@@ -1177,6 +2304,148 @@ app.post('/api/admin/email-test', adminAuth, async (req, res) => {
   } catch (err) {
     console.error('Admin email test error:', err.message || err);
     return res.status(500).json({ success: false, message: 'Failed to send test email', error: err.message });
+  }
+});
+
+/**
+ * POST /api/admin/smtp-diagnostic
+ * Detailed SMTP diagnostic endpoint with full configuration check
+ */
+app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
+  console.log('📍 POST /api/admin/smtp-diagnostic - Running SMTP diagnostics');
+  try {
+    const { testEmail } = req.body || {};
+    const targetEmail = (testEmail && String(testEmail).trim()) || DESIGNER_EMAIL || SMTP_USER || '';
+
+    const configCheck = getSmtpConfigurationCause();
+    const result = {
+      timestamp: new Date().toISOString(),
+      configuration: {
+        smtpHost: SMTP_HOST,
+        smtpPort: SMTP_PORT,
+        smtpSecure: SMTP_SECURE,
+        smtpUserConfigured: !!SMTP_USER,
+        smtpPassConfigured: hasSMTPPass,
+        configCause: configCheck.cause,
+        configMessage: configCheck.message,
+        designerEmail: DESIGNER_EMAIL,
+        noreplyEmail: NOREPLY_EMAIL,
+        transporterExists: !!emailTransporter
+      },
+      environmentVariables: {
+        SMTP_HOST: process.env.SMTP_HOST ? '✅ Set' : '❌ Not set',
+        SMTP_PORT: process.env.SMTP_PORT ? '✅ Set' : '❌ Not set',
+        SMTP_USER: process.env.SMTP_USER ? '✅ Set' : '❌ Not set',
+        SMTP_PASS: process.env.SMTP_PASS ? '✅ Set' : '❌ Not set',
+        DESIGNER_EMAIL: process.env.DESIGNER_EMAIL ? '✅ Set' : '❌ Not set',
+        DESINGER_EMAIL: process.env.DESINGER_EMAIL ? '✅ Set' : '❌ Not set',
+        NOREPLY_EMAIL: process.env.NOREPLY_EMAIL ? '✅ Set' : '❌ Not set'
+      },
+      smtpVerification: {
+        connectionSuccess: false,
+        authenticationSuccess: false,
+        cause: configCheck.cause,
+        diagnosis: configCheck.message,
+        message: configCheck.message,
+        errorDetails: null
+      }
+    };
+
+    if (configCheck.cause !== 'ok') {
+      return res.status(500).json({ success: false, diagnostics: result });
+    }
+
+    if (!emailTransporter) {
+      result.smtpVerification.cause = 'Missing Environment Variable';
+      result.smtpVerification.diagnosis = 'Email transporter is not configured. Check SMTP_USER and SMTP_PASS in your environment.';
+      result.smtpVerification.message = result.smtpVerification.diagnosis;
+      return res.status(500).json({ success: false, diagnostics: result });
+    }
+
+    try {
+      await emailTransporter.verify({ timeout: 25000 });
+      result.smtpVerification.connectionSuccess = true;
+      result.smtpVerification.authenticationSuccess = true;
+      result.smtpVerification.cause = 'ok';
+      result.smtpVerification.diagnosis = 'SMTP connection verified';
+      result.smtpVerification.message = 'SMTP connection and authentication successful';
+    } catch (verifyErr) {
+      const classification = classifySmtpError(verifyErr);
+      result.smtpVerification.cause = classification.cause;
+      result.smtpVerification.diagnosis = classification.diagnosis;
+      result.smtpVerification.message = classification.reason;
+      result.smtpVerification.errorDetails = {
+        code: verifyErr.code,
+        message: verifyErr.message,
+        command: verifyErr.command
+      };
+    }
+
+    res.json({ success: result.smtpVerification.connectionSuccess, diagnostics: result });
+  } catch (err) {
+    console.error('SMTP diagnostic error:', err);
+    return res.status(500).json({ success: false, message: 'Diagnostic failed', error: err.message });
+  }
+});
+
+/**
+ * GET /api/reviews-status
+ * Public endpoint to check approved reviews status in the database
+ */
+app.get('/api/reviews-status', async (req, res) => {
+  console.log('📍 GET /api/reviews-status - Checking reviews database status');
+  try {
+    if (!supabase) {
+      return res.json({
+        success: false,
+        status: 'no-supabase',
+        message: 'Supabase not configured',
+        reviews: {
+          inMemoryCount: reviewStore.size,
+          inMemoryApproved: Array.from(reviewStore.values()).filter(r => r.status === 'Approved').length
+        }
+      });
+    }
+
+    const { data: allReviews, error: allError } = await supabase.from('matex_reviews').select('*').order('created_at', { ascending: false });
+    const { data: approvedReviews, error: approvedError } = await supabase.from('matex_reviews').select('*').eq('status', 'Approved').order('created_at', { ascending: false });
+
+    if (allError || approvedError) {
+      console.error('Reviews status check error:', allError || approvedError);
+      return res.status(500).json({
+        success: false,
+        status: 'database-error',
+        message: 'Unable to query reviews table',
+        error: (allError || approvedError).message
+      });
+    }
+
+    const statusBreakdown = {};
+    (allReviews || []).forEach(r => {
+      const s = r.status || 'Unknown';
+      statusBreakdown[s] = (statusBreakdown[s] || 0) + 1;
+    });
+
+    return res.json({
+      success: true,
+      status: 'ok',
+      message: 'Reviews status retrieved',
+      summary: {
+        totalReviews: (allReviews || []).length,
+        approvedReviews: (approvedReviews || []).length,
+        statusBreakdown
+      },
+      recentApproved: (approvedReviews || []).slice(0, 5).map(r => ({
+        id: r.id,
+        name: r.full_name,
+        rating: r.rating,
+        status: r.status,
+        created_at: r.created_at
+      }))
+    });
+  } catch (err) {
+    console.error('Reviews status error:', err);
+    return res.status(500).json({ success: false, message: 'Status check failed', error: err.message });
   }
 });
 
@@ -1282,40 +2551,59 @@ app.post('/api/reviews', async (req, res) => {
   }
 });
 
-// Public: get approved reviews
+// Public: get approved reviews (with caching and fallback)
 app.get('/api/reviews', async (req, res) => {
+  console.log('📍 GET /api/reviews - Fetching approved reviews');
   try {
     if (supabase) {
-      const { data, error } = await supabase.from('matex_reviews').select('*').eq('status', 'Approved').order('created_at', { ascending: false });
-      if (error) {
-        console.error('Supabase fetch reviews error:', error);
-      } else {
-        return res.json({ success: true, reviews: data || [] });
+      try {
+        const { data, error } = await supabase.from('matex_reviews').select('*').eq('status', 'Approved').order('created_at', { ascending: false });
+        if (error) {
+          console.error('Supabase fetch reviews error:', error);
+          console.warn('Falling back to in-memory store');
+        } else {
+          const reviews = data || [];
+          console.log(`✅ Fetched ${reviews.length} approved reviews from Supabase`);
+          return res.json({ success: true, reviews, source: 'supabase' });
+        }
+      } catch (supabaseErr) {
+        console.error('Supabase query exception:', supabaseErr.message);
+        console.warn('Falling back to in-memory store due to Supabase error');
       }
     }
 
     // Fallback to in-memory approved reviews
     const reviews = Array.from(reviewStore.values()).filter(r => r.status === 'Approved').sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    return res.json({ success: true, reviews });
+    console.log(`✅ Fetched ${reviews.length} approved reviews from in-memory store`);
+    return res.json({ success: true, reviews, source: 'memory' });
   } catch (err) {
     console.error('Get reviews error:', err.message || err);
-    return res.status(500).json({ success: false, message: 'Unable to load reviews' });
+    return res.status(500).json({ success: false, message: 'Unable to load reviews', source: 'error' });
   }
 });
 
 // Admin: list all reviews (pending/approved/rejected)
 app.get('/api/admin/reviews', adminAuth, async (req, res) => {
+  console.log('📍 GET /api/admin/reviews - Admin fetching all reviews');
   try {
     if (supabase) {
-      const { data, error } = await supabase.from('matex_reviews').select('*').order('created_at', { ascending: false });
-      if (error) {
-        console.error('Supabase admin fetch reviews error:', error);
-        return res.status(500).json({ success: false, message: 'Unable to load admin reviews' });
+      try {
+        const { data, error } = await supabase.from('matex_reviews').select('*').order('created_at', { ascending: false });
+        if (error) {
+          console.error('Supabase admin fetch reviews error:', error);
+          console.warn('Falling back to in-memory store');
+        } else {
+          console.log(`✅ Admin fetched ${(data || []).length} reviews from Supabase`);
+          return res.json({ success: true, reviews: data || [], source: 'supabase' });
+        }
+      } catch (supabaseErr) {
+        console.error('Supabase query exception:', supabaseErr.message);
+        console.warn('Falling back to in-memory store due to Supabase error');
       }
-      return res.json({ success: true, reviews: data || [] });
     }
     const reviews = Array.from(reviewStore.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    return res.json({ success: true, reviews });
+    console.log(`✅ Admin fetched ${reviews.length} reviews from in-memory store`);
+    return res.json({ success: true, reviews, source: 'memory' });
   } catch (err) {
     console.error('Admin get reviews error:', err.message || err);
     return res.status(500).json({ success: false, message: 'Unable to load reviews' });
@@ -1328,12 +2616,21 @@ async function updateAdminReviewStatus(req, res, forcedStatus = null) {
     const status = forcedStatus || (req.body || {}).status;
     if (!id || !status) return res.status(400).json({ success: false, message: 'id and status are required' });
 
+    console.log(`📍 Updating review ${id} status to ${status}`);
+
     if (supabase) {
-      const { data, error } = await supabase.from('matex_reviews').update({ status }).eq('id', id).select().limit(1).single();
-      if (error) {
-        console.error('Supabase update review error:', error);
-      } else {
-        return res.json({ success: true, review: data });
+      try {
+        const { data, error } = await supabase.from('matex_reviews').update({ status }).eq('id', id).select().limit(1).single();
+        if (error) {
+          console.error('Supabase update review error:', error);
+          console.warn('Falling back to in-memory store');
+        } else {
+          console.log(`✅ Review ${id} updated to ${status} in Supabase`);
+          return res.json({ success: true, review: data, updated: true });
+        }
+      } catch (supabaseErr) {
+        console.error('Supabase update exception:', supabaseErr.message);
+        console.warn('Falling back to in-memory store due to Supabase error');
       }
     }
 
@@ -1341,7 +2638,8 @@ async function updateAdminReviewStatus(req, res, forcedStatus = null) {
     if (!existing) return res.status(404).json({ success: false, message: 'Review not found' });
     existing.status = status;
     reviewStore.set(id, existing);
-    return res.json({ success: true, review: existing });
+    console.log(`✅ Review ${id} updated to ${status} in memory store`);
+    return res.json({ success: true, review: existing, updated: true });
   } catch (err) {
     console.error('Admin update review error:', err.message || err);
     return res.status(500).json({ success: false, message: 'Unable to update review' });
@@ -1397,6 +2695,415 @@ app.get('/api/routes', (req, res) => {
   return res.json({ success: true, routes: getRegisteredRoutes() });
 });
 
+// ==================== REVISION REQUEST SYSTEM ====================
+
+/**
+ * POST /api/revisions/request
+ * Submit a revision request for an order
+ */
+app.post('/api/revisions/request', async (req, res) => {
+  const { order_id, customer_message } = req.body;
+  console.log(`📍 POST /api/revisions/request - Order ${order_id}`);
+  
+  if (!order_id || !customer_message || !String(customer_message).trim()) {
+    return res.status(400).json({ success: false, message: 'order_id and customer_message are required' });
+  }
+
+  try {
+    // Get current order to check revision limits
+    let order = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_orders').select('*').eq('order_id', order_id).limit(1).maybeSingle();
+      if (error) {
+        console.warn('Supabase fetch order error:', error);
+      } else {
+        order = data;
+      }
+    }
+    
+    if (!order) {
+      order = orderStore.get(order_id);
+    }
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    const revisionsAllowed = order.revision_count || 0;
+    const revisionsUsed = order.revisions_used || 0;
+    const revisionsRemaining = revisionsAllowed - revisionsUsed;
+
+    if (revisionsRemaining <= 0) {
+      return res.status(403).json({ success: false, message: 'No revisions remaining for this order' });
+    }
+
+    // Create revision request
+    const revisionRecord = {
+      order_id,
+      customer_message: String(customer_message).trim(),
+      admin_reply: null,
+      status: 'Pending',
+      revisions_used: revisionsUsed,
+      revisions_remaining: revisionsRemaining,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      approved_at: null,
+      rejected_at: null,
+      completed_at: null
+    };
+
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions').insert([revisionRecord]).select();
+      if (error) {
+        console.error('Supabase create revision error:', error);
+        return res.status(500).json({ success: false, message: 'Failed to save revision request' });
+      }
+      revisionRecord.id = data[0].id;
+    } else {
+      revisionRecord.id = `rev_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    console.log('✅ Revision request created:', revisionRecord.id);
+    res.json({ success: true, message: 'Revision request submitted', revision: revisionRecord });
+  } catch (err) {
+    console.error('❌ Revision request error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to process revision request' });
+  }
+});
+
+/**
+ * GET /api/revisions/:orderId
+ * Get all revision requests for an order
+ */
+app.get('/api/revisions/:orderId', async (req, res) => {
+  const { orderId } = req.params;
+  console.log(`📍 GET /api/revisions/${orderId}`);
+
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: 'orderId is required' });
+  }
+
+  try {
+    let revisions = [];
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions')
+        .select('*')
+        .eq('order_id', orderId)
+        .order('created_at', { ascending: false });
+      
+      if (error) {
+        console.warn('Supabase fetch revisions error:', error);
+      } else {
+        revisions = data || [];
+      }
+    }
+
+    res.json({ success: true, revisions });
+  } catch (err) {
+    console.error('❌ Fetch revisions error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to fetch revisions' });
+  }
+});
+
+/**
+ * GET /api/revisions/:orderId/summary
+ * Get revision summary (counts) for order tracker display
+ */
+app.get('/api/revisions/:orderId/summary', async (req, res) => {
+  const { orderId } = req.params;
+  console.log(`📍 GET /api/revisions/${orderId}/summary`);
+
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: 'orderId is required' });
+  }
+
+  try {
+    let order = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_orders')
+        .select('revision_count, revisions_used')
+        .eq('order_id', orderId)
+        .limit(1)
+        .maybeSingle();
+      
+      if (!error) {
+        order = data;
+      }
+    }
+
+    if (!order) {
+      order = orderStore.get(orderId);
+    }
+
+    const revisionsAllowed = order?.revision_count || 0;
+    const revisionsUsed = order?.revisions_used || 0;
+    const revisionsRemaining = Math.max(0, revisionsAllowed - revisionsUsed);
+
+    // Get pending revision count
+    let pendingCount = 0;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions')
+        .select('id')
+        .eq('order_id', orderId)
+        .eq('status', 'Pending');
+      
+      if (!error && data) {
+        pendingCount = data.length;
+      }
+    }
+
+    res.json({ 
+      success: true, 
+      summary: {
+        revisions_allowed: revisionsAllowed,
+        revisions_used: revisionsUsed,
+        revisions_remaining: revisionsRemaining,
+        pending_requests: pendingCount
+      }
+    });
+  } catch (err) {
+    console.error('❌ Fetch revision summary error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to fetch revision summary' });
+  }
+});
+
+/**
+ * PUT /api/revisions/:revisionId/approve
+ * Admin approve a revision request
+ */
+app.put('/api/revisions/:revisionId/approve', adminAuth, async (req, res) => {
+  const { revisionId } = req.params;
+  console.log(`📍 PUT /api/revisions/${revisionId}/approve - Admin approve`);
+
+  try {
+    let revision = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions')
+        .select('*')
+        .eq('id', revisionId)
+        .limit(1)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('Supabase fetch revision error:', error);
+      } else {
+        revision = data;
+      }
+    }
+
+    if (!revision) {
+      return res.status(404).json({ success: false, message: 'Revision not found' });
+    }
+
+    const updatedRevision = {
+      ...revision,
+      status: 'Approved',
+      approved_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      revisions_used: (revision.revisions_used || 0) + 1,
+      revisions_remaining: Math.max(0, (revision.revisions_remaining || 1) - 1)
+    };
+
+    if (supabase) {
+      const { error } = await supabase.from('matex_revisions')
+        .update(updatedRevision)
+        .eq('id', revisionId);
+      
+      if (error) {
+        console.error('Supabase update revision error:', error);
+        return res.status(500).json({ success: false, message: 'Failed to update revision' });
+      }
+
+      // Update the order's revisions_used count
+      const { data: orderData } = await supabase.from('matex_orders')
+        .select('revisions_used')
+        .eq('order_id', revision.order_id)
+        .limit(1)
+        .maybeSingle();
+      
+      if (orderData) {
+        await supabase.from('matex_orders')
+          .update({ revisions_used: (orderData.revisions_used || 0) + 1 })
+          .eq('order_id', revision.order_id);
+      }
+    }
+
+    console.log('✅ Revision approved:', revisionId);
+    res.json({ success: true, message: 'Revision approved', revision: updatedRevision });
+  } catch (err) {
+    console.error('❌ Approve revision error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to approve revision' });
+  }
+});
+
+/**
+ * PUT /api/revisions/:revisionId/reject
+ * Admin reject a revision request
+ */
+app.put('/api/revisions/:revisionId/reject', adminAuth, async (req, res) => {
+  const { revisionId } = req.params;
+  const { reason } = req.body;
+  console.log(`📍 PUT /api/revisions/${revisionId}/reject - Admin reject`);
+
+  try {
+    let revision = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions')
+        .select('*')
+        .eq('id', revisionId)
+        .limit(1)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('Supabase fetch revision error:', error);
+      } else {
+        revision = data;
+      }
+    }
+
+    if (!revision) {
+      return res.status(404).json({ success: false, message: 'Revision not found' });
+    }
+
+    const updatedRevision = {
+      ...revision,
+      status: 'Rejected',
+      rejected_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      admin_reply: reason || 'Revision request rejected'
+    };
+
+    if (supabase) {
+      const { error } = await supabase.from('matex_revisions')
+        .update(updatedRevision)
+        .eq('id', revisionId);
+      
+      if (error) {
+        console.error('Supabase update revision error:', error);
+        return res.status(500).json({ success: false, message: 'Failed to update revision' });
+      }
+    }
+
+    console.log('✅ Revision rejected:', revisionId);
+    res.json({ success: true, message: 'Revision rejected', revision: updatedRevision });
+  } catch (err) {
+    console.error('❌ Reject revision error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to reject revision' });
+  }
+});
+
+/**
+ * PUT /api/revisions/:revisionId/reply
+ * Admin reply to a revision request
+ */
+app.put('/api/revisions/:revisionId/reply', adminAuth, async (req, res) => {
+  const { revisionId } = req.params;
+  const { admin_reply } = req.body;
+  console.log(`📍 PUT /api/revisions/${revisionId}/reply - Admin reply`);
+
+  if (!admin_reply || !String(admin_reply).trim()) {
+    return res.status(400).json({ success: false, message: 'admin_reply is required' });
+  }
+
+  try {
+    let revision = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions')
+        .select('*')
+        .eq('id', revisionId)
+        .limit(1)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('Supabase fetch revision error:', error);
+      } else {
+        revision = data;
+      }
+    }
+
+    if (!revision) {
+      return res.status(404).json({ success: false, message: 'Revision not found' });
+    }
+
+    const updatedRevision = {
+      ...revision,
+      admin_reply: String(admin_reply).trim(),
+      updated_at: new Date().toISOString()
+    };
+
+    if (supabase) {
+      const { error } = await supabase.from('matex_revisions')
+        .update(updatedRevision)
+        .eq('id', revisionId);
+      
+      if (error) {
+        console.error('Supabase update revision error:', error);
+        return res.status(500).json({ success: false, message: 'Failed to update revision' });
+      }
+    }
+
+    console.log('✅ Revision reply sent:', revisionId);
+    res.json({ success: true, message: 'Reply sent', revision: updatedRevision });
+  } catch (err) {
+    console.error('❌ Reply revision error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to send reply' });
+  }
+});
+
+/**
+ * PUT /api/revisions/:revisionId/complete
+ * Admin mark revision as completed
+ */
+app.put('/api/revisions/:revisionId/complete', adminAuth, async (req, res) => {
+  const { revisionId } = req.params;
+  console.log(`📍 PUT /api/revisions/${revisionId}/complete - Admin complete`);
+
+  try {
+    let revision = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_revisions')
+        .select('*')
+        .eq('id', revisionId)
+        .limit(1)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('Supabase fetch revision error:', error);
+      } else {
+        revision = data;
+      }
+    }
+
+    if (!revision) {
+      return res.status(404).json({ success: false, message: 'Revision not found' });
+    }
+
+    const updatedRevision = {
+      ...revision,
+      status: 'Completed',
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    if (supabase) {
+      const { error } = await supabase.from('matex_revisions')
+        .update(updatedRevision)
+        .eq('id', revisionId);
+      
+      if (error) {
+        console.error('Supabase update revision error:', error);
+        return res.status(500).json({ success: false, message: 'Failed to update revision' });
+      }
+    }
+
+    console.log('✅ Revision completed:', revisionId);
+    res.json({ success: true, message: 'Revision completed', revision: updatedRevision });
+  } catch (err) {
+    console.error('❌ Complete revision error:', err && (err.message || err));
+    res.status(500).json({ success: false, message: 'Failed to complete revision' });
+  }
+});
+
 /**
  * Error handling middleware
  */
@@ -1438,4 +3145,29 @@ function startServer(port) {
   });
 }
 
-startServer(PORT);
+async function startApp() {
+  if (emailTransporter) {
+    const smtpResult = await ensureTransporterVerified();
+    if (!smtpResult.success) {
+      console.error('❌ SMTP startup verification failed:', {
+        cause: smtpResult.cause,
+        diagnosis: smtpResult.diagnosis,
+        reason: smtpResult.reason,
+        error: smtpResult.error,
+        errorCode: smtpResult.errorCode,
+        command: smtpResult.command
+      });
+      process.exit(1);
+    }
+    console.log('✅ SMTP startup verification succeeded. Email delivery is ready.');
+  } else {
+    console.warn('⚠️ SMTP transporter is not configured at startup. Email delivery is disabled until SMTP_USER and SMTP_PASS are set.');
+  }
+
+  startServer(PORT);
+}
+
+startApp().catch((err) => {
+  console.error('❌ Startup initialization failed:', err?.message || err);
+  process.exit(1);
+});

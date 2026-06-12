@@ -81,13 +81,7 @@ const smtpConfig = {
   },
   connectionTimeout: 30000,
   greetingTimeout: 15000,
-  socketTimeout: 45000,
-  pool: {
-    maxConnections: 5,
-    maxMessages: 100,
-    rateDelta: 20,
-    rateLimit: 14
-  }
+  socketTimeout: 45000
 };
 
 function isGmailHost(host) {
@@ -122,15 +116,25 @@ function getSmtpConfigurationCause() {
 }
 
 if (SMTP_USER && SMTP_PASS) {
-  emailTransporter = nodemailer.createTransport(smtpConfig);
-  console.log('✅ Email service configured with connection pooling');
-  console.log(`   SMTP_HOST: ${SMTP_HOST}`);
-  console.log(`   SMTP_PORT: ${SMTP_PORT}`);
-  console.log(`   SMTP_USER: ${SMTP_USER || '(not set)'}`);
-  console.log(`   hasSMTPPass: ${hasSMTPPass}`);
-  const configCheck = getSmtpConfigurationCause();
-  if (configCheck.cause !== 'ok') {
-    console.warn(`   SMTP configuration warning: ${configCheck.cause} - ${configCheck.message}`);
+  try {
+    emailTransporter = nodemailer.createTransport(smtpConfig);
+    emailTransporter.on('error', (err) => {
+      console.error('⚠️ SMTP transporter connection error:', err && (err.message || err));
+      // Don't crash on transporter errors - log and continue
+    });
+    console.log('✅ Email service configured');
+    console.log(`   SMTP_HOST: ${SMTP_HOST}`);
+    console.log(`   SMTP_PORT: ${SMTP_PORT}`);
+    console.log(`   SMTP_USER: ${SMTP_USER || '(not set)'}`);
+    console.log(`   hasSMTPPass: ${hasSMTPPass}`);
+    const configCheck = getSmtpConfigurationCause();
+    if (configCheck.cause !== 'ok') {
+      console.warn(`   SMTP configuration warning: ${configCheck.cause} - ${configCheck.message}`);
+    }
+  } catch (err) {
+    console.error('❌ Failed to create email transporter:', err?.message || err);
+    console.warn('⚠️ Email notifications will be disabled');
+    emailTransporter = null;
   }
 } else {
   console.warn('⚠️ Email configuration incomplete; email notifications disabled');
@@ -163,7 +167,13 @@ async function ensureTransporterVerified() {
   }
 
   try {
-    await emailTransporter.verify({ timeout: 20000 });
+    // Set a hard timeout for verification to prevent hanging
+    const verifyPromise = emailTransporter.verify();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('SMTP verification timeout (>15s)')), 15000)
+    );
+    
+    await Promise.race([verifyPromise, timeoutPromise]);
     smtpTransporterVerified = true;
     return { success: true };
   } catch (err) {
@@ -315,7 +325,13 @@ async function runSmtpDiagnostics(targetEmail) {
   });
 
   try {
-    await transporter.verify({ timeout: 20000 });
+    // Wrap verify with a hard timeout to prevent hanging
+    const verifyPromise = transporter.verify();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('SMTP verification timeout (>15s)')), 15000)
+    );
+    
+    await Promise.race([verifyPromise, timeoutPromise]);
     diagnostics.connectionSuccess = true;
     diagnostics.authenticationSuccess = true;
     diagnostics.diagnosis = 'SMTP connection and authentication succeeded.';
@@ -1870,7 +1886,9 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
 
         // Do NOT auto-send confirmation to customer. Admin must manually accept/update order lifecycle.
         if (DESIGNER_EMAIL) {
-          sendEmail(DESIGNER_EMAIL, `New Order - ${updatedOrder.order_id}`, designerHtml);
+          await sendEmail(DESIGNER_EMAIL, `New Order - ${updatedOrder.order_id}`, designerHtml).catch(err => {
+            console.error('Designer notification failed:', err?.message || err);
+          });
         }
         if (customerEmail) {
           console.log(`ℹ️ Customer confirmation suppressed for ${updatedOrder.order_id}; awaiting admin action`);
@@ -2139,6 +2157,44 @@ app.post('/api/orders/brief', async (req, res) => {
     orderStore.set(order_id, merged);
     console.log('✅ Brief saved to in-memory store for', order_id);
     console.log('✅ All brief fields persisted:', Object.keys(merged).filter(k => ['design_description', 'whatsapp_number', 'brand_name', 'brand_color', 'dob', 'deadline', 'reference_link', 'additional_note'].includes(k)));
+    
+    // Create a chat conversation for this order if one doesn't exist
+    let conversation_id = merged.conversation_id;
+    if (!conversation_id) {
+      try {
+        const conversationData = {
+          customer_name: merged.client_name || 'Customer',
+          customer_email: merged.client_email || null,
+          customer_phone: merged.whatsapp_number || null,
+          subject: `Order ${order_id}: ${merged.service_name || 'Project'}`,
+          status: 'open',
+          source: 'website',
+          order_id: order_id,
+          unread_admin_count: 0,
+          unread_customer_count: 0,
+          last_message_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+        const createdConversation = await persistChatConversation(conversationData);
+        if (createdConversation && createdConversation.id) {
+          conversation_id = createdConversation.id;
+          merged.conversation_id = conversation_id;
+          
+          // Update the order with conversation_id
+          const updatePayload = { ...upsertData, conversation_id };
+          if (supabase) {
+            await persistOrder(updatePayload);
+          }
+          orderStore.set(order_id, merged);
+          console.log('✅ Chat conversation created and linked to order:', order_id, 'conversation_id:', conversation_id);
+        }
+      } catch (convErr) {
+        console.warn('⚠️ Failed to create conversation for order:', convErr.message || convErr);
+        // Continue even if conversation creation fails - it's not critical
+      }
+    }
+    
     return res.json({ success: true, order: merged });
   } catch (err) {
     console.error('Brief upsert error:', err.message);
@@ -2363,7 +2419,13 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
     }
 
     try {
-      await emailTransporter.verify({ timeout: 25000 });
+      // Wrap verify with a hard timeout to prevent hanging
+      const verifyPromise = emailTransporter.verify();
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('SMTP verification timeout (>15s)')), 15000)
+      );
+      
+      await Promise.race([verifyPromise, timeoutPromise]);
       result.smtpVerification.connectionSuccess = true;
       result.smtpVerification.authenticationSuccess = true;
       result.smtpVerification.cause = 'ok';
@@ -2498,7 +2560,9 @@ app.get('/api/reviews-status', async (req, res) => {
           </div>
         </div>
       `;
-      sendEmail(DESIGNER_EMAIL, `Order Details - ${orderId}`, designerEmailHtml);
+      await sendEmail(DESIGNER_EMAIL, `Order Details - ${orderId}`, designerEmailHtml).catch(err => {
+        console.error('Designer notification failed:', err?.message || err);
+      });
 
       return res.json({ success: true, message: 'Designer notification sent' });
     }
@@ -3147,19 +3211,30 @@ function startServer(port) {
 
 async function startApp() {
   if (emailTransporter) {
-    const smtpResult = await ensureTransporterVerified();
-    if (!smtpResult.success) {
-      console.error('❌ SMTP startup verification failed:', {
-        cause: smtpResult.cause,
-        diagnosis: smtpResult.diagnosis,
-        reason: smtpResult.reason,
-        error: smtpResult.error,
-        errorCode: smtpResult.errorCode,
-        command: smtpResult.command
-      });
-      process.exit(1);
+    try {
+      const smtpResult = await ensureTransporterVerified();
+      if (!smtpResult.success) {
+        console.warn('⚠️ SMTP startup verification failed. Email delivery disabled.', {
+          cause: smtpResult.cause,
+          diagnosis: smtpResult.diagnosis,
+          reason: smtpResult.reason,
+          error: smtpResult.error,
+          errorCode: smtpResult.errorCode,
+          command: smtpResult.command
+        });
+        // Continue even if SMTP fails - don't crash the server
+        emailTransporter = null;
+        smtpTransporterVerified = false;
+      } else {
+        console.log('✅ SMTP startup verification succeeded. Email delivery is ready.');
+      }
+    } catch (verifyErr) {
+      console.error('⚠️ Unexpected error during SMTP verification:', verifyErr?.message || verifyErr);
+      console.warn('⚠️ Email delivery disabled due to verification error');
+      // Continue - don't crash the entire server due to email issues
+      emailTransporter = null;
+      smtpTransporterVerified = false;
     }
-    console.log('✅ SMTP startup verification succeeded. Email delivery is ready.');
   } else {
     console.warn('⚠️ SMTP transporter is not configured at startup. Email delivery is disabled until SMTP_USER and SMTP_PASS are set.');
   }

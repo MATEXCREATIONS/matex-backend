@@ -1834,6 +1834,7 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
       payment_type: paymentTypeRaw,
       payment_status: paymentStatus,
       payment_reference: transaction.reference,
+      reference: transaction.reference,
       payment_date: paymentDate,
       paid_at: paymentDate,
       download_access: downloadAccess,
@@ -2512,8 +2513,10 @@ app.get('/api/reviews-status', async (req, res) => {
 });
 
 /**
- * POST /send-designer-notification
-
+ * POST /api/designer/notify
+ * Send designer notification for an order
+ */
+app.post('/api/designer/notify', async (req, res) => {
   console.log('📍 POST /api/designer/notify - Send designer notification');
   try {
     const { orderId } = req.body;

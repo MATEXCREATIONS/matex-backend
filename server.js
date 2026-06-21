@@ -307,7 +307,7 @@ async function runSmtpDiagnostics(targetEmail) {
     diagnosis: configStatus.cause,
     reason: configStatus.message,
     targetEmail: typeof targetEmail === 'string' ? targetEmail.trim() : ''
-  };
+  }; 
 
   if (configStatus.cause !== 'ok') {
     return diagnostics;

@@ -3,7 +3,7 @@
 ## Base URL
 ```
 http://localhost:5001  (local development)
-https://matex-backend.onrender.com  (production)
+https://api.matexcreations.com  (production)
 ```
 
 ## Endpoints
@@ -216,7 +216,7 @@ https://matex-backend.onrender.com  (production)
 
 ```javascript
 // Create Payment
-const response = await fetch('https://matex-backend.onrender.com/create-payment', {
+const response = await fetch('https://api.matexcreations.com/create-payment', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
@@ -231,7 +231,7 @@ const data = await response.json();
 window.location.href = data.authorization_url;
 
 // Track Order
-const trackResponse = await fetch('https://matex-backend.onrender.com/track-order/MATEX-2026-001');
+const trackResponse = await fetch('https://api.matexcreations.com/track-order/MATEX-2026-001');
 const trackData = await trackResponse.json();
 console.log(trackData.order);
 ```
@@ -240,7 +240,7 @@ console.log(trackData.order);
 
 ```bash
 # Create Payment
-curl -X POST https://matex-backend.onrender.com/create-payment \
+curl -X POST https://api.matexcreations.com/create-payment \
   -H "Content-Type: application/json" \
   -d '{
     "order_id": "MATEX-2026-001",
@@ -251,10 +251,10 @@ curl -X POST https://matex-backend.onrender.com/create-payment \
   }'
 
 # Track Order
-curl https://matex-backend.onrender.com/track-order/MATEX-2026-001
+curl https://api.matexcreations.com/track-order/MATEX-2026-001
 
 # Update Order Status
-curl -X PUT https://matex-backend.onrender.com/update-order-status/MATEX-2026-001 \
+curl -X PUT https://api.matexcreations.com/update-order-status/MATEX-2026-001 \
   -H "Content-Type: application/json" \
   -d '{
     "status": "In Progress",

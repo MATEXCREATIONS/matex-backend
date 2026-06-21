@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS public.matex_orders (
   payment_type text,
   revision_count int,
   latest_progress text,
-  status_history jsonb,
   created_at timestamp with time zone DEFAULT now()
 );
 

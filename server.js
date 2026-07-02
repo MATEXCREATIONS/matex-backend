@@ -463,7 +463,7 @@ function normalizeOrderFile(record) {
     uploaded_at: record.uploaded_at || now,
     delivery_status: record.delivery_status || 'Delivered',
     notify_sent: Boolean(record.notify_sent || false),
-    metadata: record.metadata || null
+    metadata: Object.assign({}, record.metadata || {}, { file_type: record.file_type || (record.metadata && record.metadata.file_type) || null })
   };
 }
 
@@ -558,7 +558,7 @@ function normalizeChatMessage(message) {
 }
 
 async function persistChatConversation(conversation) {
-  if (!conversation || !conversation.id) return conversation;
+  if (!conversation) return conversation;
   const record = normalizeChatConversation(conversation);
   if (!supabase) {
     chatConversationsStore.set(record.id, record);
@@ -640,6 +640,25 @@ async function loadChatConversationById(conversationId) {
   }
 }
 
+async function loadChatConversationByOrderId(orderId) {
+  const normalizedOrderId = String(orderId || '').trim();
+  if (!normalizedOrderId) return null;
+  if (!supabase) {
+    return Array.from(chatConversationsStore.values()).find((conversation) => String(conversation.order_id || '') === normalizedOrderId) || null;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_chat_conversations').select('*').eq('order_id', normalizedOrderId).order('last_message_at', { ascending: false }).limit(1).maybeSingle();
+    if (error) {
+      console.error('Supabase loadChatConversationByOrderId error:', error);
+      return null;
+    }
+    return data || null;
+  } catch (err) {
+    console.error('loadChatConversationByOrderId exception:', err.message || err);
+    return null;
+  }
+}
+
 async function loadChatMessages(conversationId) {
   if (!conversationId) return [];
   if (!supabase) {
@@ -712,6 +731,7 @@ async function notifyCustomerAboutAdminReply(conversation, message) {
 
 const SUPABASE_ORDER_FIELDS = [
   'order_id',
+  'conversation_id',
   'client_name',
   'client_email',
   'whatsapp_number',
@@ -728,6 +748,9 @@ const SUPABASE_ORDER_FIELDS = [
   'download_access',
   'order_status',
   'revision_count',
+  'revisions_allowed',
+  'revisions_used',
+  'revisions_remaining',
   'latest_progress',
   'status_history',
   'metadata',
@@ -748,6 +771,18 @@ function getRevisionCount(paymentType) {
   return 1;
 }
 
+function computeRevisionState(order = {}) {
+  const paymentType = String(order.payment_type || order.paymentType || order.paymentMethod || '').toLowerCase();
+  const allowed = Number.isFinite(Number(order.revisions_allowed))
+    ? Number(order.revisions_allowed)
+    : (Number.isFinite(Number(order.revision_count)) ? Number(order.revision_count) : getRevisionCount(paymentType));
+  const used = Number.isFinite(Number(order.revisions_used))
+    ? Number(order.revisions_used)
+    : (Number.isFinite(Number(order.revision_count)) ? Number(order.revision_count) : 0);
+  const remaining = Math.max(allowed - used, 0);
+  return { allowed, used, remaining };
+}
+
 function normalizeOrderRecord(order) {
   if (!order || !order.order_id) return null;
   const amount = typeof order.amount === 'number' ? order.amount : (Number(order.amount) || null);
@@ -758,6 +793,7 @@ function normalizeOrderRecord(order) {
 
   const record = {
     order_id: String(order.order_id),
+    conversation_id: order.conversation_id || order.conversationId || null,
     client_name: order.client_name || order.full_name || null,
     client_email: order.client_email || order.email || null,
     whatsapp_number: order.whatsapp_number || order.client_phone || order.phone || null,
@@ -785,6 +821,12 @@ function normalizeOrderRecord(order) {
     deadline: order.deadline || null,
     created_at: order.created_at || new Date().toISOString()
   };
+
+  const revisionState = computeRevisionState(Object.assign({}, order, record));
+  record.revision_count = revisionState.allowed;
+  record.revisions_allowed = revisionState.allowed;
+  record.revisions_used = revisionState.used;
+  record.revisions_remaining = revisionState.remaining;
 
   if (Object.prototype.hasOwnProperty.call(order, 'status_history')) {
     record.status_history = order.status_history;
@@ -1255,6 +1297,7 @@ app.post('/api/admin/orders/:orderId/files', adminAuth, upload.array('files'), a
         storage_path: storagePath,
         bucket_name: bucket,
         mime_type: mime,
+        file_type: (version_label_value || '').toLowerCase().includes('final') ? 'final' : 'revision',
         file_size: fileSize,
         version_label: version_label_value,
         uploaded_by,
@@ -1337,12 +1380,19 @@ app.get('/api/orders/:orderId/files', async (req, res) => {
     const isDownloadAllowed = Boolean(order && order.download_access);
 
     const mapped = await Promise.all(files.map(async f => {
-      const downloadAllowed = isDownloadAllowed;
+      const downloadAllowed = isDownloadAllowed && ((f.metadata && f.metadata.file_type) ? f.metadata.file_type === 'final' : true);
       let download_url = null;
+      let preview_url = null;
+      if ((f.metadata && f.metadata.file_type) === 'revision') {
+        // For revision uploads, provide preview (no download)
+        if (supabase && f.storage_path) {
+          preview_url = await createSignedUrlForFile(f.bucket_name || 'order-deliveries', f.storage_path, 3600);
+        }
+      }
       if (downloadAllowed && supabase && f.storage_path) {
         download_url = await createSignedUrlForFile(f.bucket_name || 'order-deliveries', f.storage_path, 3600);
       }
-      return Object.assign({}, f, { download_allowed: downloadAllowed, download_url });
+      return Object.assign({}, f, { download_allowed: downloadAllowed, download_url, preview_url });
     }));
 
     return res.json({ success: true, files: mapped, download_access: isDownloadAllowed });
@@ -1408,23 +1458,59 @@ app.get('/api/admin/orders/:orderId/files/:fileId/download', adminAuth, async (r
 app.post('/api/chat/conversations', async (req, res) => {
   console.log('📍 POST /api/chat/conversations - Creating a new conversation');
   try {
-    const { customer_name, customer_email, customer_phone, subject, initial_message } = req.body || {};
+    const { customer_name, customer_email, customer_phone, subject, initial_message, order_id } = req.body || {};
     if (!initial_message || !String(initial_message).trim()) {
       return res.status(400).json({ success: false, message: 'Initial message is required.' });
     }
 
-    const conversation = await persistChatConversation({
+    const normalizedOrderId = order_id ? String(order_id).trim() : '';
+    let conversation = null;
+    if (normalizedOrderId) {
+      conversation = await loadChatConversationByOrderId(normalizedOrderId);
+    }
+
+    const conversationData = {
       customer_name: String(customer_name || 'Guest'),
       customer_email: customer_email ? String(customer_email).trim() : null,
       customer_phone: customer_phone ? String(customer_phone).trim() : null,
       subject: String(subject || 'Live chat inquiry'),
       status: 'open',
       source: 'website',
-      unread_admin_count: 1,
+      order_id: normalizedOrderId || null,
+      unread_admin_count: conversation ? Number(conversation.unread_admin_count || 0) + 1 : 1,
+      unread_customer_count: conversation?.unread_customer_count || 0,
       last_message_at: new Date().toISOString(),
-      created_at: new Date().toISOString(),
+      created_at: conversation?.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString()
-    });
+    };
+
+    if (!conversation) {
+      conversation = await persistChatConversation(conversationData);
+    } else {
+      conversation = await updateChatConversation(conversation.id, {
+        customer_name: conversationData.customer_name,
+        customer_email: conversationData.customer_email,
+        customer_phone: conversationData.customer_phone,
+        subject: conversationData.subject,
+        order_id: normalizedOrderId || conversation.order_id || null,
+        status: conversation.status || 'open',
+        source: conversation.source || 'website',
+        updated_at: conversationData.updated_at
+      });
+    }
+
+    if (normalizedOrderId) {
+      try {
+        const existingOrder = orderStore.get(normalizedOrderId) || null;
+        const nextOrder = existingOrder ? Object.assign({}, existingOrder, { conversation_id: conversation.id, order_id: normalizedOrderId }) : { order_id: normalizedOrderId, conversation_id: conversation.id };
+        orderStore.set(normalizedOrderId, nextOrder);
+        if (supabase) {
+          await persistOrder(nextOrder);
+        }
+      } catch (orderErr) {
+        console.warn('Failed to link chat conversation to order:', orderErr?.message || orderErr);
+      }
+    }
 
     const message = await persistChatMessage({
       conversation_id: conversation.id,
@@ -1434,6 +1520,14 @@ app.post('/api/chat/conversations', async (req, res) => {
       body: String(initial_message).trim(),
       is_system: false
     });
+
+    // Record timeline event: Message Sent
+    try {
+      const entry = { event: 'Message Sent', message: String(initial_message).trim(), ts: new Date().toISOString() };
+      const existingHistory = Array.isArray(conversation.status_history) ? conversation.status_history : [];
+      const newHistory = [...existingHistory, entry];
+      await updateChatConversation(conversation.id, { status_history: newHistory, latest_progress: 'Customer sent a message' }).catch(() => null);
+    } catch (e) { console.warn('Failed to append message timeline to conversation', e); }
 
     await notifyAdminAboutNewChatMessage(conversation, message);
 
@@ -1499,6 +1593,25 @@ app.post('/api/chat/conversations/:conversationId/messages', async (req, res) =>
 
     if (message.sender === 'customer') {
       await notifyAdminAboutNewChatMessage(updatedConversation || conversation, message);
+      // append to timeline on order if linked
+      try {
+        if (updatedConversation?.order_id) {
+          const entry = { event: 'Message Sent', message: String(message.body).trim(), ts: new Date().toISOString() };
+          // update order status_history
+          if (supabase) {
+            const ordRes = await supabase.from('matex_orders').select('status_history').eq('order_id', updatedConversation.order_id).limit(1).maybeSingle();
+            const existing = ordRes && !ordRes.error && Array.isArray(ordRes.data?.status_history) ? ordRes.data.status_history : [];
+            const newHist = [...existing, entry];
+            await supabase.from('matex_orders').update({ status_history: newHist, latest_progress: 'Customer message' }).eq('order_id', updatedConversation.order_id).catch(() => null);
+          } else {
+            const existing = orderStore.get(updatedConversation.order_id) || {};
+            const hist = Array.isArray(existing.status_history) ? existing.status_history : [];
+            existing.status_history = [...hist, entry];
+            existing.latest_progress = 'Customer message';
+            orderStore.set(updatedConversation.order_id, existing);
+          }
+        }
+      } catch (e) { console.warn('Failed to append order timeline for message', e); }
     }
     if (message.sender === 'admin') {
       await notifyCustomerAboutAdminReply(updatedConversation || conversation, message);
@@ -1563,6 +1676,24 @@ app.post('/api/admin/chat/conversations/:conversationId/messages', adminAuth, as
     });
 
     await notifyCustomerAboutAdminReply(updatedConversation || conversation, message);
+    // append to order timeline
+    try {
+      if (updatedConversation?.order_id) {
+        const entry = { event: 'Message Sent (admin)', message: String(message.body).trim(), ts: new Date().toISOString() };
+        if (supabase) {
+          const ordRes = await supabase.from('matex_orders').select('status_history').eq('order_id', updatedConversation.order_id).limit(1).maybeSingle();
+          const existing = ordRes && !ordRes.error && Array.isArray(ordRes.data?.status_history) ? ordRes.data.status_history : [];
+          const newHist = [...existing, entry];
+          await supabase.from('matex_orders').update({ status_history: newHist, latest_progress: 'Admin replied' }).eq('order_id', updatedConversation.order_id).catch(() => null);
+        } else {
+          const existing = orderStore.get(updatedConversation.order_id) || {};
+          const hist = Array.isArray(existing.status_history) ? existing.status_history : [];
+          existing.status_history = [...hist, entry];
+          existing.latest_progress = 'Admin replied';
+          orderStore.set(updatedConversation.order_id, existing);
+        }
+      }
+    } catch (e) { console.warn('Failed to append order timeline for admin reply', e); }
     return res.json({ success: true, conversation: updatedConversation, message });
   } catch (err) {
     console.error('Admin reply error:', err.message || err);
@@ -2058,7 +2189,7 @@ async function trackOrderHandler(req, res) {
 
   if (supabase) {
     try {
-        const orderSelect = 'order_id, client_name, client_email, whatsapp_number, service_name, amount, amount_paid, amount_remaining, payment_method, payment_type, payment_status, payment_reference, payment_date, paid_at, download_access, order_status, revision_count, latest_progress, status_history, design_description, brand_name, brand_color, dob, deadline, reference_link, additional_note, metadata, created_at';
+        const orderSelect = 'order_id, conversation_id, client_name, client_email, whatsapp_number, service_name, amount, amount_paid, amount_remaining, payment_method, payment_type, payment_status, payment_reference, payment_date, paid_at, download_access, order_status, revision_count, latest_progress, status_history, design_description, brand_name, brand_color, dob, deadline, reference_link, additional_note, metadata, created_at';
         const result = await supabase.from('matex_orders')
         .select(orderSelect)
         .eq('order_id', normalizedOrderId)
@@ -2159,10 +2290,11 @@ app.post('/api/orders/brief', async (req, res) => {
     console.log('✅ Brief saved to in-memory store for', order_id);
     console.log('✅ All brief fields persisted:', Object.keys(merged).filter(k => ['design_description', 'whatsapp_number', 'brand_name', 'brand_color', 'dob', 'deadline', 'reference_link', 'additional_note'].includes(k)));
     
-    // Create a chat conversation for this order if one doesn't exist
+    // Create or reuse a chat conversation for this order
     let conversation_id = merged.conversation_id;
     if (!conversation_id) {
       try {
+        const existingConversation = await loadChatConversationByOrderId(order_id);
         const conversationData = {
           customer_name: merged.client_name || 'Customer',
           customer_email: merged.client_email || null,
@@ -2171,13 +2303,15 @@ app.post('/api/orders/brief', async (req, res) => {
           status: 'open',
           source: 'website',
           order_id: order_id,
-          unread_admin_count: 0,
-          unread_customer_count: 0,
-          last_message_at: new Date().toISOString(),
-          created_at: new Date().toISOString(),
+          unread_admin_count: existingConversation?.unread_admin_count || 0,
+          unread_customer_count: existingConversation?.unread_customer_count || 0,
+          last_message_at: existingConversation?.last_message_at || new Date().toISOString(),
+          created_at: existingConversation?.created_at || new Date().toISOString(),
           updated_at: new Date().toISOString()
         };
-        const createdConversation = await persistChatConversation(conversationData);
+        const createdConversation = existingConversation
+          ? await updateChatConversation(existingConversation.id, conversationData)
+          : await persistChatConversation(conversationData);
         if (createdConversation && createdConversation.id) {
           conversation_id = createdConversation.id;
           merged.conversation_id = conversation_id;
@@ -2188,10 +2322,10 @@ app.post('/api/orders/brief', async (req, res) => {
             await persistOrder(updatePayload);
           }
           orderStore.set(order_id, merged);
-          console.log('✅ Chat conversation created and linked to order:', order_id, 'conversation_id:', conversation_id);
+          console.log('✅ Chat conversation linked to order:', order_id, 'conversation_id:', conversation_id);
         }
       } catch (convErr) {
-        console.warn('⚠️ Failed to create conversation for order:', convErr.message || convErr);
+        console.warn('⚠️ Failed to create or reuse conversation for order:', convErr.message || convErr);
         // Continue even if conversation creation fails - it's not critical
       }
     }
@@ -2771,13 +2905,12 @@ app.get('/api/routes', (req, res) => {
 app.post('/api/revisions/request', async (req, res) => {
   const { order_id, customer_message } = req.body;
   console.log(`📍 POST /api/revisions/request - Order ${order_id}`);
-  
+
   if (!order_id || !customer_message || !String(customer_message).trim()) {
     return res.status(400).json({ success: false, message: 'order_id and customer_message are required' });
   }
 
   try {
-    // Get current order to check revision limits
     let order = null;
     if (supabase) {
       const { data, error } = await supabase.from('matex_orders').select('*').eq('order_id', order_id).limit(1).maybeSingle();
@@ -2787,7 +2920,7 @@ app.post('/api/revisions/request', async (req, res) => {
         order = data;
       }
     }
-    
+
     if (!order) {
       order = orderStore.get(order_id);
     }
@@ -2796,22 +2929,24 @@ app.post('/api/revisions/request', async (req, res) => {
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
 
-    const revisionsAllowed = order.revision_count || 0;
-    const revisionsUsed = order.revisions_used || 0;
-    const revisionsRemaining = revisionsAllowed - revisionsUsed;
+    const revisionState = computeRevisionState(order);
+    const revisionsAllowed = revisionState.allowed;
+    const revisionsUsed = revisionState.used;
+    const revisionsRemaining = revisionState.remaining;
 
     if (revisionsRemaining <= 0) {
       return res.status(403).json({ success: false, message: 'No revisions remaining for this order' });
     }
 
-    // Create revision request
+    const nextUsed = revisionsUsed + 1;
+    const nextRemaining = Math.max(revisionsAllowed - nextUsed, 0);
     const revisionRecord = {
       order_id,
       customer_message: String(customer_message).trim(),
       admin_reply: null,
       status: 'Pending',
-      revisions_used: revisionsUsed,
-      revisions_remaining: revisionsRemaining,
+      revisions_used: nextUsed,
+      revisions_remaining: nextRemaining,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       approved_at: null,
@@ -2826,9 +2961,44 @@ app.post('/api/revisions/request', async (req, res) => {
         return res.status(500).json({ success: false, message: 'Failed to save revision request' });
       }
       revisionRecord.id = data[0].id;
+      await supabase.from('matex_orders').update({ revisions_used: nextUsed, revisions_remaining: nextRemaining, revision_count: revisionsAllowed, latest_progress: 'Revision requested by customer' }).eq('order_id', order_id).catch(() => null);
     } else {
       revisionRecord.id = `rev_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const existingOrder = orderStore.get(order_id) || {};
+      existingOrder.revisions_used = nextUsed;
+      existingOrder.revisions_remaining = nextRemaining;
+      existingOrder.revision_count = revisionsAllowed;
+      existingOrder.latest_progress = 'Revision requested by customer';
+      orderStore.set(order_id, existingOrder);
     }
+
+    const timelineEntry = { event: 'Revision Requested', message: String(customer_message).trim(), updated_at: new Date().toISOString() };
+    if (supabase) {
+      const existingRes = await supabase.from('matex_orders').select('status_history').eq('order_id', order_id).limit(1).maybeSingle();
+      const history = existingRes && !existingRes.error && Array.isArray(existingRes.data?.status_history) ? existingRes.data.status_history : [];
+      await supabase.from('matex_orders').update({ status_history: [...history, timelineEntry], latest_progress: 'Revision requested by customer' }).eq('order_id', order_id).catch(() => null);
+    } else {
+      const existingOrder = orderStore.get(order_id) || {};
+      const history = Array.isArray(existingOrder.status_history) ? existingOrder.status_history : [];
+      existingOrder.status_history = [...history, timelineEntry];
+      existingOrder.latest_progress = 'Revision requested by customer';
+      orderStore.set(order_id, existingOrder);
+    }
+
+    const conversation = await loadChatConversationByOrderId(order_id).catch(() => null);
+    if (conversation?.id) {
+      await persistChatMessage({
+        conversation_id: conversation.id,
+        sender: 'system',
+        sender_name: 'System',
+        sender_email: null,
+        body: `Revision requested: ${String(customer_message).trim()}`,
+        is_system: true
+      }).catch(() => null);
+      await updateChatConversation(conversation.id, { unread_admin_count: Number(conversation.unread_admin_count || 0) + 1, last_message_at: new Date().toISOString(), updated_at: new Date().toISOString() }).catch(() => null);
+    }
+
+    await sendEmail(DESIGNER_EMAIL, `Revision requested for ${order_id}`, buildCustomerNotificationHtml({ order_id, client_name: order.client_name || 'Customer', client_email: order.client_email || '', latest_progress: 'Revision requested by customer' }, `A revision was requested for ${order_id}.`)).catch(() => null);
 
     console.log('✅ Revision request created:', revisionRecord.id);
     res.json({ success: true, message: 'Revision request submitted', revision: revisionRecord });
@@ -2902,9 +3072,10 @@ app.get('/api/revisions/:orderId/summary', async (req, res) => {
       order = orderStore.get(orderId);
     }
 
-    const revisionsAllowed = order?.revision_count || 0;
-    const revisionsUsed = order?.revisions_used || 0;
-    const revisionsRemaining = Math.max(0, revisionsAllowed - revisionsUsed);
+    const revisionState = computeRevisionState(order || {});
+    const revisionsAllowed = revisionState.allowed;
+    const revisionsUsed = revisionState.used;
+    const revisionsRemaining = revisionState.remaining;
 
     // Get pending revision count
     let pendingCount = 0;

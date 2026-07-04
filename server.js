@@ -28,6 +28,16 @@ app.use(cors({
 }));
 app.options('*', cors());
 app.use(express.json());
+
+// Security headers middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Paystack Configuration
@@ -1564,6 +1574,16 @@ app.post('/api/chat/conversations/:conversationId/messages', async (req, res) =>
     if (!body || !String(body).trim()) {
       return res.status(400).json({ success: false, message: 'Message body is required.' });
     }
+    
+    // Input validation: sanitize body length and sender values
+    const bodyStr = String(body).trim();
+    if (bodyStr.length > 5000) {
+      return res.status(400).json({ success: false, message: 'Message is too long (max 5000 characters).' });
+    }
+    const normalizedSender = String(sender || 'customer').toLowerCase();
+    if (!['customer', 'admin'].includes(normalizedSender)) {
+      return res.status(400).json({ success: false, message: 'Invalid sender type.' });
+    }
 
     const conversation = await loadChatConversationById(conversationId);
     if (!conversation) {
@@ -1572,10 +1592,10 @@ app.post('/api/chat/conversations/:conversationId/messages', async (req, res) =>
 
     const message = await persistChatMessage({
       conversation_id: conversationId,
-      sender: String(sender),
-      sender_name: String(sender_name || (sender === 'admin' ? 'Admin' : conversation.customer_name || 'Customer')), 
-      sender_email: sender_email || (sender === 'customer' ? conversation.customer_email : null),
-      body: String(body).trim(),
+      sender: normalizedSender,
+      sender_name: String(sender_name || (normalizedSender === 'admin' ? 'Admin' : conversation.customer_name || 'Customer')).trim().slice(0, 100), 
+      sender_email: sender_email ? String(sender_email).trim().slice(0, 255) : (normalizedSender === 'customer' ? conversation.customer_email : null),
+      body: bodyStr,
       is_system: false
     });
 
@@ -1596,7 +1616,7 @@ app.post('/api/chat/conversations/:conversationId/messages', async (req, res) =>
       // append to timeline on order if linked
       try {
         if (updatedConversation?.order_id) {
-          const entry = { event: 'Message Sent', message: String(message.body).trim(), ts: new Date().toISOString() };
+          const entry = { event: 'Message Sent', message: bodyStr.slice(0, 200), ts: new Date().toISOString() };
           // update order status_history
           if (supabase) {
             const ordRes = await supabase.from('matex_orders').select('status_history').eq('order_id', updatedConversation.order_id).limit(1).maybeSingle();
@@ -1655,6 +1675,13 @@ app.post('/api/admin/chat/conversations/:conversationId/messages', adminAuth, as
     if (!conversationId || !body || !String(body).trim()) {
       return res.status(400).json({ success: false, message: 'Conversation id and body are required.' });
     }
+    
+    // Input validation: sanitize body length
+    const bodyStr = String(body).trim();
+    if (bodyStr.length > 5000) {
+      return res.status(400).json({ success: false, message: 'Message is too long (max 5000 characters).' });
+    }
+    
     const conversation = await loadChatConversationById(conversationId);
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation not found.' });
@@ -1663,9 +1690,9 @@ app.post('/api/admin/chat/conversations/:conversationId/messages', adminAuth, as
     const message = await persistChatMessage({
       conversation_id: conversationId,
       sender: 'admin',
-      sender_name: String(sender_name || 'Admin'),
+      sender_name: String(sender_name || 'Admin').trim().slice(0, 100),
       sender_email: DESIGNER_EMAIL || null,
-      body: String(body).trim(),
+      body: bodyStr,
       is_system: false
     });
 
@@ -1679,7 +1706,7 @@ app.post('/api/admin/chat/conversations/:conversationId/messages', adminAuth, as
     // append to order timeline
     try {
       if (updatedConversation?.order_id) {
-        const entry = { event: 'Message Sent (admin)', message: String(message.body).trim(), ts: new Date().toISOString() };
+        const entry = { event: 'Message Sent (admin)', message: bodyStr.slice(0, 200), ts: new Date().toISOString() };
         if (supabase) {
           const ordRes = await supabase.from('matex_orders').select('status_history').eq('order_id', updatedConversation.order_id).limit(1).maybeSingle();
           const existing = ordRes && !ordRes.error && Array.isArray(ordRes.data?.status_history) ? ordRes.data.status_history : [];
@@ -1718,6 +1745,28 @@ app.put('/api/admin/chat/conversations/:conversationId/status', adminAuth, async
   } catch (err) {
     console.error('Update conversation status error:', err.message || err);
     return res.status(500).json({ success: false, message: 'Unable to update conversation status.' });
+  }
+});
+
+app.post('/api/admin/chat/conversations/:conversationId/read', adminAuth, async (req, res) => {
+  console.log(`📍 POST /api/admin/chat/conversations/${req.params.conversationId}/read - Mark as read`);
+  try {
+    const conversationId = String(req.params.conversationId || '').trim();
+    if (!conversationId) {
+      return res.status(400).json({ success: false, message: 'Conversation id is required.' });
+    }
+    const conversation = await loadChatConversationById(conversationId);
+    if (!conversation) {
+      return res.status(404).json({ success: false, message: 'Conversation not found.' });
+    }
+    const updatedConversation = await updateChatConversation(conversationId, {
+      unread_admin_count: 0,
+      updated_at: new Date().toISOString()
+    });
+    return res.json({ success: true, conversation: updatedConversation });
+  } catch (err) {
+    console.error('Mark conversation as read error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to mark conversation as read.' });
   }
 });
 

@@ -1,24 +1,33 @@
 import express from 'express';
 import cors from 'cors';
 import axios from 'axios';
-import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
 import multer from 'multer';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import config from './lib/config.js';
+import { createAdminToken, adminAuth } from './lib/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load .env from matex-backend directory
-const envPath = path.resolve(__dirname, '.env');
-dotenv.config({ path: envPath });
+// Configuration loaded from ./lib/config.js (which already reads .env)
 
 const app = express();
-// Use PORT from environment (Render assigns this), fallback to 5001 for local development
-const PORT = process.env.PORT || 5001;
+// Use PORT from configuration module (which loads environment variables)
+const PORT = config.PORT;
+
+const configValidation = config.validateConfig();
+if (configValidation.warnings.length > 0) {
+  console.warn('⚠️ Backend configuration warnings:');
+  configValidation.warnings.forEach((warning) => console.warn(`  - ${warning}`));
+}
+if (configValidation.errors.length > 0) {
+  console.error('❌ Backend configuration errors:');
+  configValidation.errors.forEach((error) => console.error(`  - ${error}`));
+}
 
 // Middleware
 app.use(cors({
@@ -41,88 +50,28 @@ app.use((req, res, next) => {
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Paystack Configuration
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const PAYSTACK_API_URL = 'https://api.paystack.co';
+const PAYSTACK_SECRET_KEY = config.PAYSTACK_SECRET_KEY;
+const PAYSTACK_API_URL = config.PAYSTACK_API_URL;
 
 // Service Pricing Configuration - SINGLE SOURCE OF TRUTH
-const SERVICE_PRICING = {
-  'Graphic Design': {
-    name: 'Graphic Design',
-    description: 'Flyers • Posters • Logos',
-    naira: 6000,
-    usd: 4,
-    currency: 'NGN'
-  },
-  'Video Editing': {
-    name: 'Video Editing',
-    description: 'YouTube edits • Ad videos • Showreels',
-    naira: 9000,
-    usd: 6,
-    currency: 'NGN'
-  },
-  'Brand Identity': {
-    name: 'Brand Identity',
-    description: 'Complete branding packages',
-    naira: 15000,
-    usd: 10,
-    currency: 'NGN'
-  }
-};
+const SERVICE_PRICING = config.SERVICE_PRICING;
 
 // Email Configuration
 let emailTransporter = null;
 let smtpTransporterVerified = false;
-const DESIGNER_EMAIL = process.env.DESIGNER_EMAIL || process.env.DESINGER_EMAIL || 'designer@matexcreations.com';
-const NOREPLY_EMAIL = process.env.NOREPLY_EMAIL || 'noreply@matexcreations.com';
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
-const SMTP_PORT = Number(process.env.SMTP_PORT || '587');
-const SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
+const DESIGNER_EMAIL = config.DESIGNER_EMAIL;
+const NOREPLY_EMAIL = config.NOREPLY_EMAIL;
+const SMTP_HOST = config.SMTP_HOST;
+const SMTP_PORT = config.SMTP_PORT;
+const SMTP_SECURE = config.SMTP_SECURE;
+const SMTP_USER = config.SMTP_USER;
+const SMTP_PASS = config.SMTP_PASS;
 const hasSMTPPass = Boolean(SMTP_PASS);
 
-const smtpConfig = {
-  host: SMTP_HOST,
-  port: SMTP_PORT,
-  secure: SMTP_SECURE,
-  auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-  tls: {
-    rejectUnauthorized: false
-  },
-  connectionTimeout: 30000,
-  greetingTimeout: 15000,
-  socketTimeout: 45000
-};
-
-function isGmailHost(host) {
-  return String(host || '').toLowerCase().includes('gmail.com');
-}
+const smtpConfig = config.smtpConfig;
 
 function getSmtpConfigurationCause() {
-  if (!process.env.SMTP_HOST) {
-    return { cause: 'Missing Environment Variable', message: 'SMTP_HOST is not configured.' };
-  }
-  if (!process.env.SMTP_PORT) {
-    return { cause: 'Missing Environment Variable', message: 'SMTP_PORT is not configured.' };
-  }
-  if (!process.env.SMTP_USER) {
-    return { cause: 'Missing Environment Variable', message: 'SMTP_USER is not configured.' };
-  }
-  if (!hasSMTPPass) {
-    return { cause: 'Missing App Password', message: 'SMTP_PASS is not configured. Gmail SMTP requires an app password.' };
-  }
-  if (isGmailHost(SMTP_HOST)) {
-    if (SMTP_PORT === 465 && !SMTP_SECURE) {
-      return { cause: 'Wrong Secure Setting', message: 'Gmail port 465 requires secure=true.' };
-    }
-    if (SMTP_PORT === 587 && SMTP_SECURE) {
-      return { cause: 'Wrong Secure Setting', message: 'Gmail port 587 requires secure=false.' };
-    }
-    if (![465, 587].includes(SMTP_PORT)) {
-      return { cause: 'Wrong Port', message: 'Gmail SMTP should use port 587 (secure=false) or 465 (secure=true).' };
-    }
-  }
-  return { cause: 'ok', message: 'SMTP configuration appears valid.' };
+  return config.getSmtpConfigurationCause();
 }
 
 if (SMTP_USER && SMTP_PASS) {
@@ -897,13 +846,11 @@ async function persistOrder(order) {
   }
 }
 
-// Supabase configuration (optional fallback to in-memory store)
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+// Supabase and admin auth wired via config and lib modules
 let supabase = null;
-if (SUPABASE_URL && SUPABASE_KEY) {
+if (config.SUPABASE_URL && config.SUPABASE_KEY) {
   try {
-    supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
     console.log('✅ Supabase client initialized');
   } catch (err) {
     console.error('Supabase initialization failed:', err.message);
@@ -913,53 +860,10 @@ if (SUPABASE_URL && SUPABASE_KEY) {
   console.warn('⚠️ SUPABASE_URL or SUPABASE_KEY not set; running without Supabase persistence.');
 }
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY || '';
-const ADMIN_TOKEN_TTL_MS = Number(process.env.ADMIN_TOKEN_TTL_MS || '1800000');
-
-function createAdminToken() {
-  const payload = JSON.stringify({ ts: Date.now() });
-  const signature = crypto.createHmac('sha256', ADMIN_SECRET_KEY).update(payload).digest('hex');
-  return Buffer.from(`${payload}.${signature}`).toString('base64url');
-}
-
-function verifyAdminToken(token) {
-  if (!token || !ADMIN_SECRET_KEY) return false;
-  try {
-    const decoded = Buffer.from(token, 'base64url').toString('utf8');
-    const [payload, signature] = decoded.split('.');
-    if (!payload || !signature) return false;
-    const expectedSignature = crypto.createHmac('sha256', ADMIN_SECRET_KEY).update(payload).digest('hex');
-    const signatureBuffer = Buffer.from(signature, 'hex');
-    const expectedBuffer = Buffer.from(expectedSignature, 'hex');
-    if (signatureBuffer.length !== expectedBuffer.length) return false;
-    if (!crypto.timingSafeEqual(expectedBuffer, signatureBuffer)) return false;
-    const parsed = JSON.parse(payload);
-    if (!parsed.ts || typeof parsed.ts !== 'number') return false;
-    return Date.now() - parsed.ts <= ADMIN_TOKEN_TTL_MS;
-  } catch (err) {
-    return false;
-  }
-}
-
-function adminAuth(req, res, next) {
-  if (!ADMIN_PASSWORD || !ADMIN_SECRET_KEY) {
-    return res.status(503).json({ success: false, message: 'Admin service is not configured.' });
-  }
-  const authHeader = String(req.headers.authorization || '');
-  if (!authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, message: 'Missing Authorization header.' });
-  }
-  const token = authHeader.slice(7).trim();
-  if (!verifyAdminToken(token)) {
-    return res.status(401).json({ success: false, message: 'Invalid or expired admin token.' });
-  }
-  next();
-}
+// Use admin auth helpers from ./lib/auth.js
 
 if (!PAYSTACK_SECRET_KEY) {
-  console.error('❌ PAYSTACK_SECRET_KEY is not defined in .env');
-  process.exit(1);
+  console.warn('⚠️ PAYSTACK_SECRET_KEY is not defined in .env; checkout routes will be disabled until configured.');
 }
 
 // ==================== ROUTES ====================
@@ -1003,7 +907,7 @@ app.get('/api/services', (req, res) => {
 
 app.post('/api/admin/login', (req, res) => {
   console.log('📍 POST /api/admin/login - Admin login attempt');
-  if (!ADMIN_PASSWORD || !ADMIN_SECRET_KEY) {
+  if (!config.ADMIN_PASSWORD || !config.ADMIN_SECRET_KEY) {
     console.error('❌ Admin login request rejected: ADMIN_PASSWORD or ADMIN_SECRET_KEY is not configured');
     return res.status(503).json({ success: false, message: 'Admin login is not configured.' });
   }
@@ -1017,7 +921,7 @@ app.post('/api/admin/login', (req, res) => {
     return res.status(400).json({ success: false, message: 'Password is required.' });
   }
 
-  if (password !== ADMIN_PASSWORD) {
+  if (password !== config.ADMIN_PASSWORD) {
     console.warn('⚠️ Admin login failed - invalid password attempt');
     return res.status(401).json({ success: false, message: 'Invalid password.' });
   }
@@ -2573,13 +2477,13 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
         transporterExists: !!emailTransporter
       },
       environmentVariables: {
-        SMTP_HOST: process.env.SMTP_HOST ? '✅ Set' : '❌ Not set',
-        SMTP_PORT: process.env.SMTP_PORT ? '✅ Set' : '❌ Not set',
-        SMTP_USER: process.env.SMTP_USER ? '✅ Set' : '❌ Not set',
-        SMTP_PASS: process.env.SMTP_PASS ? '✅ Set' : '❌ Not set',
-        DESIGNER_EMAIL: process.env.DESIGNER_EMAIL ? '✅ Set' : '❌ Not set',
-        DESINGER_EMAIL: process.env.DESINGER_EMAIL ? '✅ Set' : '❌ Not set',
-        NOREPLY_EMAIL: process.env.NOREPLY_EMAIL ? '✅ Set' : '❌ Not set'
+        SMTP_HOST: SMTP_HOST ? '✅ Set' : '❌ Not set',
+        SMTP_PORT: SMTP_PORT ? '✅ Set' : '❌ Not set',
+        SMTP_USER: SMTP_USER ? '✅ Set' : '❌ Not set',
+        SMTP_PASS: SMTP_PASS ? '✅ Set' : '❌ Not set',
+        DESIGNER_EMAIL: DESIGNER_EMAIL ? '✅ Set' : '❌ Not set',
+        DESINGER_EMAIL: config.DESIGNER_EMAIL ? '✅ Set' : '❌ Not set',
+        NOREPLY_EMAIL: NOREPLY_EMAIL ? '✅ Set' : '❌ Not set'
       },
       smtpVerification: {
         connectionSuccess: false,
@@ -3399,7 +3303,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({
     success: false,
     message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+    error: config.NODE_ENV === 'development' ? err.message : undefined
   });
 });
 
@@ -3419,7 +3323,7 @@ function startServer(port) {
   const server = app.listen(port, () => {
     console.log(`\n✅ Matex backend is running on http://localhost:${port}`);
     console.log(`📦 Paystack integration active`);
-    console.log(`🔐 Environment: ${process.env.NODE_ENV || 'development'}\n`);
+    console.log(`🔐 Environment: ${config.NODE_ENV}\n`);
   });
 
   server.on('error', (err) => {

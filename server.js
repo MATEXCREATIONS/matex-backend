@@ -55,6 +55,7 @@ const PAYSTACK_API_URL = config.PAYSTACK_API_URL;
 
 // Service Pricing Configuration - SINGLE SOURCE OF TRUTH
 const SERVICE_PRICING = config.SERVICE_PRICING;
+const ADMIN_TOKEN_TTL_MS = config.ADMIN_TOKEN_TTL_MS;
 
 // Email Configuration
 let emailTransporter = null;

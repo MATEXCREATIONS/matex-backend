@@ -8,7 +8,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import config from './lib/config.js';
-import { createAdminToken, adminAuth } from './lib/auth.js';
+import { createAdminToken, adminAuth, verifyAdminToken } from './lib/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -522,6 +522,7 @@ async function persistChatConversation(conversation) {
   const record = normalizeChatConversation(conversation);
   if (!supabase) {
     chatConversationsStore.set(record.id, record);
+    try { broadcastAdminEvent('chat_conversation', record); } catch (e) {}
     return record;
   }
   try {
@@ -531,8 +532,10 @@ async function persistChatConversation(conversation) {
       throw error;
     }
     if (Array.isArray(data) && data.length > 0) {
+      try { broadcastAdminEvent('chat_conversation', data[0]); } catch (e) {}
       return data[0];
     }
+    try { broadcastAdminEvent('chat_conversation', record); } catch (e) {}
     return record;
   } catch (err) {
     console.error('persistChatConversation exception:', err.message || err);
@@ -547,6 +550,7 @@ async function persistChatMessage(message) {
     const messages = chatMessagesStore.get(record.conversation_id) || [];
     messages.push(record);
     chatMessagesStore.set(record.conversation_id, messages);
+    try { broadcastAdminEvent('chat_message', record); } catch (e) {}
     return record;
   }
   try {
@@ -556,11 +560,58 @@ async function persistChatMessage(message) {
       throw error;
     }
     if (Array.isArray(data) && data.length > 0) {
+      try { broadcastAdminEvent('chat_message', data[0]); } catch (e) {}
       return data[0];
     }
+    try { broadcastAdminEvent('chat_message', record); } catch (e) {}
     return record;
   } catch (err) {
     console.error('persistChatMessage exception:', err.message || err);
+    return record;
+  }
+}
+
+const emailReplyStore = new Map();
+
+function extractOrderIdFromEmailSubject(subject) {
+  if (!subject) return null;
+  const normalized = String(subject || '').trim();
+  const match = normalized.match(/(?:order(?: id|#|ref| reference)?[:\s-]*)([A-Za-z0-9\-_]+)/i);
+  return match ? match[1] : null;
+}
+
+async function persistEmailReply(reply) {
+  if (!reply) return null;
+  const record = {
+    id: String(reply.id || crypto.randomUUID()),
+    from_email: String(reply.from_email || reply.from || '').trim() || null,
+    subject: String(reply.subject || '').trim() || null,
+    body: String(reply.body || reply.text || '').trim() || null,
+    html: reply.html || null,
+    order_id: String(reply.order_id || extractOrderIdFromEmailSubject(reply.subject) || '').trim() || null,
+    message_id: String(reply.message_id || reply['message-id'] || '').trim() || null,
+    in_reply_to: String(reply.in_reply_to || reply['in-reply-to'] || '').trim() || null,
+    created_at: new Date().toISOString()
+  };
+
+  if (!supabase) {
+    emailReplyStore.set(record.id, record);
+    try { broadcastAdminEvent('email_reply', record); } catch (e) {}
+    return record;
+  }
+
+  try {
+    const { data, error } = await supabase.from('matex_email_replies').insert([record]).select();
+    if (error) {
+      console.error('Supabase persistEmailReply error:', error);
+      throw error;
+    }
+    const persisted = Array.isArray(data) && data.length > 0 ? data[0] : record;
+    try { broadcastAdminEvent('email_reply', persisted); } catch (e) {}
+    return persisted;
+  } catch (err) {
+    console.error('persistEmailReply exception:', err.message || err);
+    try { broadcastAdminEvent('email_reply', record); } catch (e) {}
     return record;
   }
 }
@@ -833,16 +884,20 @@ async function persistOrder(order) {
       }
     }
 
-    const { data, error } = await supabase.from('matex_orders').upsert([merged], { onConflict: 'order_id' });
+    const { data, error } = await supabase.from('matex_orders').upsert([merged], { onConflict: 'order_id' }).select();
     if (error) {
       console.error('❌ Supabase persistOrder error for', record.order_id, JSON.stringify(error, Object.getOwnPropertyNames(error)));
+      try { broadcastAdminEvent('order', record); } catch (e) {}
       // keep order in memory and continue, but surface the failure to logs
       return order;
     }
+    const persisted = Array.isArray(data) && data.length > 0 ? data[0] : merged;
     console.log('✅ Order persisted to Supabase:', record.order_id);
-    return order;
+    try { broadcastAdminEvent('order', persisted); } catch (e) {}
+    return persisted;
   } catch (err) {
     console.error('❌ Supabase persistOrder exception for', record.order_id, err && (err.message || err));
+    try { broadcastAdminEvent('order', record); } catch (e) {}
     return order;
   }
 }
@@ -853,6 +908,22 @@ if (config.SUPABASE_URL && config.SUPABASE_KEY) {
   try {
     supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
     console.log('✅ Supabase client initialized');
+    // Wire realtime listeners to forward DB events to connected admin SSE clients
+    try {
+      const channel = supabase.channel('realtime_events');
+      channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_chat_messages' }, (payload) => {
+        try { broadcastAdminEvent('chat_message', payload.record || payload); } catch (e) { /* ignore */ }
+      });
+      channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_chat_conversations' }, (payload) => {
+        try { broadcastAdminEvent('chat_conversation', payload.record || payload); } catch (e) { /* ignore */ }
+      });
+      channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_orders' }, (payload) => {
+        try { broadcastAdminEvent('order', payload.record || payload); } catch (e) { /* ignore */ }
+      });
+      channel.subscribe().then(() => console.log('✅ Supabase realtime channel subscribed')).catch(() => {});
+    } catch (e) {
+      console.warn('⚠️ Failed to initialize Supabase realtime channel:', e && (e.message || e));
+    }
   } catch (err) {
     console.error('Supabase initialization failed:', err.message);
     supabase = null;
@@ -860,6 +931,100 @@ if (config.SUPABASE_URL && config.SUPABASE_KEY) {
 } else {
   console.warn('⚠️ SUPABASE_URL or SUPABASE_KEY not set; running without Supabase persistence.');
 }
+
+// Simple Server-Sent Events (SSE) implementation for admin realtime UI
+const adminEventClients = new Set();
+
+function sendSse(res, event, data) {
+  try {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch (e) {
+    // ignore
+  }
+}
+
+function broadcastAdminEvent(event, payload) {
+  for (const res of Array.from(adminEventClients)) {
+    try {
+      sendSse(res, event, payload);
+    } catch (e) {
+      try { res.end(); } catch (er) {}
+      adminEventClients.delete(res);
+    }
+  }
+}
+
+// SSE endpoint for admin clients to receive realtime updates
+app.get('/api/admin/events', (req, res) => {
+  // Allow EventSource connections to pass `?token=` since EventSource can't set Authorization header.
+  const queryToken = String(req.query?.token || '').trim();
+  const authHeader = String(req.headers.authorization || '').trim();
+  let ok = false;
+  if (queryToken) {
+    try { ok = verifyAdminToken(queryToken); } catch (e) { ok = false; }
+  } else if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    try { ok = verifyAdminToken(token); } catch (e) { ok = false; }
+  }
+  if (!ok) return res.status(401).json({ success: false, message: 'Unauthorized' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders && res.flushHeaders();
+  res.write('retry: 10000\n\n');
+  adminEventClients.add(res);
+
+  // Send an initial ping so clients know connection is live
+  sendSse(res, 'connected', { ts: Date.now() });
+
+  req.on('close', () => {
+    adminEventClients.delete(res);
+  });
+});
+
+app.post('/api/inbound/email/reply', async (req, res) => {
+  console.log('📍 POST /api/inbound/email/reply - Incoming email reply webhook');
+  try {
+    const payload = req.body || {};
+    const reply = {
+      id: String(payload.id || payload.message_id || crypto.randomUUID()),
+      from_email: String(payload.from || payload['from'] || '').trim() || null,
+      subject: String(payload.subject || '').trim() || null,
+      body: String(payload.text || payload.body || '').trim() || null,
+      html: payload.html || null,
+      order_id: String(payload.order_id || extractOrderIdFromEmailSubject(payload.subject) || '').trim() || null,
+      message_id: String(payload.message_id || payload['message-id'] || '').trim() || null,
+      in_reply_to: String(payload.in_reply_to || payload['in-reply-to'] || '').trim() || null,
+      created_at: new Date().toISOString()
+    };
+
+    const storedReply = await persistEmailReply(reply);
+    if (storedReply.order_id) {
+      const conversation = await loadChatConversationByOrderId(storedReply.order_id);
+      if (conversation) {
+        const message = await persistChatMessage({
+          conversation_id: conversation.id,
+          sender: 'customer',
+          sender_name: storedReply.from_email || 'Email customer',
+          sender_email: storedReply.from_email,
+          body: storedReply.body || 'Email reply received',
+          is_system: false
+        });
+        await updateChatConversation(conversation.id, {
+          last_message_at: new Date().toISOString(),
+          unread_admin_count: Number(conversation.unread_admin_count || 0) + 1
+        }).catch(() => null);
+      }
+    }
+
+    return res.json({ success: true, reply: storedReply });
+  } catch (err) {
+    console.error('Inbound email reply error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to process email reply.' });
+  }
+});
 
 // Use admin auth helpers from ./lib/auth.js
 
@@ -878,8 +1043,40 @@ app.get('/', (req, res) => {
 });
 
 // Health check under the /api prefix for consistency with API routes
-app.get('/api/health', (req, res) => {
-  res.json({ success: true, message: 'Matex API healthy' });
+app.get('/api/health', async (req, res) => {
+  const smtpConfigured = Boolean(emailTransporter);
+  const supabaseConfigured = Boolean(supabase);
+  const smtpConfiguration = getSmtpConfigurationCause();
+  let supabaseOnline = null;
+  let supabaseCheck = null;
+
+  if (supabase) {
+    try {
+      const start = Date.now();
+      const { error } = await supabase.from('matex_orders').select('order_id').limit(1).maybeSingle();
+      supabaseOnline = !Boolean(error);
+      supabaseCheck = {
+        latencyMs: Date.now() - start,
+        error: error ? (error.message || String(error)) : null
+      };
+    } catch (err) {
+      supabaseOnline = false;
+      supabaseCheck = { error: err?.message || String(err) };
+    }
+  }
+
+  return res.json({
+    success: true,
+    message: 'Matex API healthy',
+    timestamp: new Date().toISOString(),
+    supabaseConfigured,
+    supabaseOnline,
+    supabaseCheck,
+    smtpConfigured,
+    smtpVerified: smtpTransporterVerified,
+    smtpConfiguration,
+    adminEventsConnected: adminEventClients.size
+  });
 });
 
 /**
@@ -1061,6 +1258,7 @@ app.put('/api/admin/orders/:orderId', adminAuth, async (req, res) => {
       if (orderStore.has(orderId)) {
         orderStore.set(orderId, updatedOrder);
       }
+      try { broadcastAdminEvent('order', updatedOrder); } catch (e) {}
       if (updatedOrder.client_email) {
         try {
           const message = updatePayload.latest_progress || `Order status updated to ${updatePayload.order_status || updatedOrder.order_status}`;
@@ -1236,6 +1434,7 @@ app.post('/api/admin/orders/:orderId/files', adminAuth, upload.array('files'), a
         if (clientEmail) {
           await sendEmail(clientEmail, `Files uploaded for ${orderId}`, buildCustomerNotificationHtml({ order_id: orderId, client_name: '', client_email: clientEmail, latest_progress: 'Files uploaded by admin' }, `Admin uploaded ${uploadedRecords.length} file(s). Please check your project files.`));
         }
+        try { broadcastAdminEvent('order', { order_id: orderId, latest_progress: 'Files uploaded by admin', status_history: newHistory }); } catch (e) {}
       } else {
         // in-memory order store fallback
         const existing = orderStore.get(orderId) || {};
@@ -1247,7 +1446,9 @@ app.post('/api/admin/orders/:orderId/files', adminAuth, upload.array('files'), a
         if (existing.client_email) {
           await sendEmail(existing.client_email, `Files uploaded for ${orderId}`, buildCustomerNotificationHtml({ order_id: orderId, client_email: existing.client_email }, `Admin uploaded ${uploadedRecords.length} file(s).`));
         }
+        try { broadcastAdminEvent('order', existing); } catch (e) {}
       }
+      try { broadcastAdminEvent('order_file', { order_id: orderId, files: uploadedRecords }); } catch (e) {}
     } catch (notifyErr) {
       console.error('Order history update / notification failed:', notifyErr.message || notifyErr);
     }
@@ -2536,6 +2737,97 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
   } catch (err) {
     console.error('SMTP diagnostic error:', err);
     return res.status(500).json({ success: false, message: 'Diagnostic failed', error: err.message });
+  }
+});
+
+app.get('/api/admin/storage-diagnostic', adminAuth, async (req, res) => {
+  console.log('📍 GET /api/admin/storage-diagnostic - Running Supabase storage diagnostics');
+  const diagnostics = {
+    supabaseConfigured: Boolean(supabase),
+    bucket: 'order-deliveries',
+    database: { connected: false, error: null, latencyMs: null },
+    storage: { accessible: false, error: null, sampleItems: null }
+  };
+
+  if (!supabase) {
+    diagnostics.database.error = 'Supabase is not configured.';
+    diagnostics.storage.error = 'Supabase is not configured.';
+    return res.status(500).json({ success: false, diagnostics, message: 'Supabase is not configured.' });
+  }
+
+  try {
+    const start = Date.now();
+    const { error: dbError } = await supabase.from('matex_orders').select('order_id').limit(1).maybeSingle();
+    diagnostics.database.connected = !Boolean(dbError);
+    diagnostics.database.latencyMs = Date.now() - start;
+    diagnostics.database.error = dbError ? (dbError.message || String(dbError)) : null;
+  } catch (err) {
+    diagnostics.database.connected = false;
+    diagnostics.database.error = err?.message || String(err);
+  }
+
+  try {
+    const { data: storageData, error: storageError } = await supabase.storage.from(diagnostics.bucket).list('', { limit: 5 });
+    diagnostics.storage.accessible = !Boolean(storageError);
+    diagnostics.storage.error = storageError ? (storageError.message || String(storageError)) : null;
+    diagnostics.storage.sampleItems = Array.isArray(storageData) ? storageData : null;
+  } catch (err) {
+    diagnostics.storage.accessible = false;
+    diagnostics.storage.error = err?.message || String(err);
+  }
+
+  const success = diagnostics.database.connected && diagnostics.storage.accessible;
+  return res.status(success ? 200 : 500).json({ success, diagnostics });
+});
+
+/**
+ * POST /api/email/inbound
+ * Ingest inbound email payloads (webhook) and persist as chat messages.
+ * Expected JSON: { order_id, from_name, from_email, subject, body, source }
+ */
+app.post('/api/email/inbound', async (req, res) => {
+  try {
+    const { order_id, from_name, from_email, subject, body, source } = req.body || {};
+    if (!body || (!order_id && !from_email)) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    // Try to find or create a conversation linked to the order
+    let conversation = null;
+    if (order_id) {
+      conversation = await loadChatConversationByOrderId(order_id).catch(() => null);
+    }
+    if (!conversation) {
+      // create a minimal conversation record
+      const convo = {
+        order_id: order_id || null,
+        subject: subject || `Email from ${from_name || from_email}`,
+        created_by: 'email_inbound',
+        status: 'open',
+        client_name: from_name || null,
+        client_email: from_email || null
+      };
+      conversation = await persistChatConversation(convo).catch(() => null);
+    }
+
+    if (!conversation) return res.status(500).json({ success: false, message: 'Unable to create conversation' });
+
+    const message = {
+      conversation_id: conversation.id,
+      sender: 'customer',
+      sender_name: from_name || from_email || 'Customer',
+      sender_email: from_email || null,
+      body: String(body || ''),
+      metadata: { source: source || 'email' }
+    };
+
+    const stored = await persistChatMessage(message).catch(() => null);
+    if (!stored) return res.status(500).json({ success: false, message: 'Unable to persist inbound message' });
+
+    return res.json({ success: true, conversation, message: stored });
+  } catch (err) {
+    console.error('Inbound email webhook error:', err && (err.message || err));
+    return res.status(500).json({ success: false, message: 'Inbound processing failed' });
   }
 });
 

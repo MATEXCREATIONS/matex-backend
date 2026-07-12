@@ -58,6 +58,42 @@ CREATE TABLE IF NOT EXISTS public.matex_revisions (
   completed_at timestamptz
 );
 
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS amount_paid numeric DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revisions_allowed integer DEFAULT 1;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revisions_used integer DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revisions_remaining integer DEFAULT 1;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revision_count integer DEFAULT 1;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS latest_progress text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS status_history jsonb;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS metadata jsonb;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS design_description text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS brand_name text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS brand_color text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS dob text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS deadline text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS reference_link text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS additional_note text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
+
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS order_id text;
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS unread_admin_count integer DEFAULT 0;
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS unread_customer_count integer DEFAULT 0;
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS last_message_at timestamptz;
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
+
+ALTER TABLE public.matex_chat_messages ADD COLUMN IF NOT EXISTS conversation_id uuid;
+ALTER TABLE public.matex_chat_messages ADD COLUMN IF NOT EXISTS is_system boolean DEFAULT false;
+
+ALTER TABLE public.matex_order_files ADD COLUMN IF NOT EXISTS delivery_status text DEFAULT 'Delivered';
+ALTER TABLE public.matex_order_files ADD COLUMN IF NOT EXISTS notify_sent boolean DEFAULT false;
+ALTER TABLE public.matex_order_files ADD COLUMN IF NOT EXISTS metadata jsonb;
+
+ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revisions_used integer DEFAULT 0;
+ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revisions_remaining integer DEFAULT 0;
+ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS approved_at timestamptz;
+ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS rejected_at timestamptz;
+ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS completed_at timestamptz;
+
 CREATE INDEX IF NOT EXISTS idx_matex_chat_messages_conversation_id ON public.matex_chat_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_matex_order_files_order_id ON public.matex_order_files(order_id);
 CREATE INDEX IF NOT EXISTS idx_matex_revisions_order_id ON public.matex_revisions(order_id);

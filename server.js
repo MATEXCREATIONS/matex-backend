@@ -129,26 +129,6 @@ function serializeSmtpError(err) {
   return serialized;
 }
 
-function serializeSmtpError(err) {
-  if (!err) return null;
-  const serialized = {
-    message: err.message || String(err),
-    code: err.code || null,
-    command: err.command || null,
-    response: err.response || null,
-    responseCode: err.responseCode || null,
-    stack: err.stack || null
-  };
-
-  for (const key of Object.getOwnPropertyNames(err)) {
-    if (!(key in serialized)) {
-      serialized[key] = err[key];
-    }
-  }
-
-  return serialized;
-}
-
 async function ensureTransporterVerified() {
   if (!emailTransporter) {
     smtpTransporterVerified = false;
@@ -1051,33 +1031,6 @@ async function ensureSupabaseSchemaCompatibility() {
   return { ok: checks.every((item) => item.ok), checked: true, details: checks };
 }
 
-async function ensureSupabaseSchemaCompatibility() {
-  if (!supabase) return { ok: true, checked: false, details: [] };
-  const checks = [];
-  const tableChecks = [
-    { table: 'matex_orders', columns: ['amount_paid', 'revisions_allowed', 'revisions_used', 'revisions_remaining', 'revision_count'] },
-    { table: 'matex_chat_conversations', columns: ['order_id', 'unread_admin_count', 'unread_customer_count'] },
-    { table: 'matex_chat_messages', columns: ['conversation_id', 'is_system'] },
-    { table: 'matex_order_files', columns: ['delivery_status', 'notify_sent'] },
-    { table: 'matex_revisions', columns: ['revisions_used', 'revisions_remaining'] }
-  ];
-
-  for (const check of tableChecks) {
-    try {
-      const { data, error } = await supabase.from(check.table).select('*').limit(1);
-      if (error) {
-        checks.push({ table: check.table, ok: false, error: error.message || String(error) });
-        continue;
-      }
-      checks.push({ table: check.table, ok: true, columns: Array.isArray(data) ? [] : [] });
-    } catch (err) {
-      checks.push({ table: check.table, ok: false, error: err?.message || String(err) });
-    }
-  }
-
-  return { ok: checks.every((item) => item.ok), checked: true, details: checks };
-}
-
 async function persistOrder(order) {
   if (!order || !order.order_id) return order;
   const record = normalizeOrderRecord(order);
@@ -1168,41 +1121,6 @@ async function persistOrder(order) {
     try { broadcastAdminEvent('order', record); } catch (e) {}
     return order;
   }
-}
-
-async function loadOrderById(orderId) {
-  const normalized = String(orderId || '').trim();
-  if (!normalized) return null;
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from('matex_orders').select('*').eq('order_id', normalized).limit(1).maybeSingle();
-      if (!error && data) return data;
-    } catch (err) {
-      console.warn('Supabase loadOrderById warning:', err?.message || err);
-    }
-
-    try {
-      const fallback = await loadOrderByReference(normalized);
-      if (fallback) return fallback;
-    } catch (err) {
-      console.warn('Supabase loadOrderById fallback warning:', err?.message || err);
-    }
-  }
-  return orderStore.get(normalized) || null;
-}
-
-async function loadOrderByReference(reference) {
-  const normalized = String(reference || '').trim();
-  if (!normalized) return null;
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from('matex_orders').select('*').or(`payment_reference.eq.${normalized},order_id.eq.${normalized}`).limit(1).maybeSingle();
-      if (!error && data) return data;
-    } catch (err) {
-      console.warn('Supabase loadOrderByReference warning:', err?.message || err);
-    }
-  }
-  return orderStore.get(normalized) || null;
 }
 
 async function loadOrderById(orderId) {

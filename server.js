@@ -129,6 +129,20 @@ function serializeSmtpError(err) {
   return serialized;
 }
 
+function logEmailEvent(event, details) {
+  const payload = {
+    event,
+    timestamp: new Date().toISOString(),
+    ...details
+  };
+
+  if (event.endsWith('_failed')) {
+    console.error('[email]', JSON.stringify(payload));
+  } else {
+    console.log('[email]', JSON.stringify(payload));
+  }
+}
+
 async function ensureTransporterVerified() {
   if (!emailTransporter) {
     smtpTransporterVerified = false;
@@ -184,24 +198,45 @@ async function ensureTransporterVerified() {
 async function sendEmail(to, subject, html, fromEmail, retries = 2) {
   const normalizedTo = typeof to === 'string' ? to.trim() : '';
   if (!normalizedTo) {
-    console.warn('⚠️ Email send skipped because recipient is empty');
+    logEmailEvent('email_send_skipped', {
+      reason: 'empty_recipient',
+      subject
+    });
     return false;
   }
 
   if (!emailTransporter) {
-    console.warn('⚠️ Email transporter not configured');
+    logEmailEvent('email_send_failed', {
+      reason: 'transporter_not_configured',
+      recipient: normalizedTo,
+      subject
+    });
     return false;
   }
 
   const configCause = getSmtpConfigurationCause();
   if (configCause.cause !== 'ok') {
-    console.error('❌ SMTP configuration is invalid; aborting send:', configCause);
+    logEmailEvent('email_send_failed', {
+      reason: 'invalid_smtp_configuration',
+      recipient: normalizedTo,
+      subject,
+      cause: configCause.cause,
+      diagnosis: configCause.message
+    });
     return false;
   }
 
   const fromAddress = fromEmail || config.SMTP_FROM || NOREPLY_EMAIL;
   for (let attempt = 1; attempt <= retries + 1; attempt++) {
     try {
+      logEmailEvent('email_send_attempt', {
+        recipient: normalizedTo,
+        subject,
+        attempt,
+        totalAttempts: retries + 1,
+        from: fromAddress
+      });
+
       const sendPromise = emailTransporter.sendMail({
         from: fromAddress,
         to: normalizedTo,
@@ -212,16 +247,24 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
         setTimeout(() => reject(new Error('SMTP send timeout (>60s)')), 60000)
       );
       const result = await Promise.race([sendPromise, timeoutPromise]);
-      console.log(`✅ Email sent to ${normalizedTo}: ${subject} (Attempt ${attempt})`);
       smtpTransporterVerified = true;
+      logEmailEvent('email_send_success', {
+        recipient: normalizedTo,
+        subject,
+        attempt,
+        messageId: result?.messageId || null,
+        response: result?.response || null
+      });
       return true;
     } catch (err) {
       smtpTransporterVerified = false;
       const classification = classifySmtpError(err);
       const isLastAttempt = attempt === retries + 1;
-      console.error(`❌ Email send attempt ${attempt}/${retries + 1} failed to ${normalizedTo}:`, {
-        message: err?.message || String(err),
-        code: err?.code,
+      logEmailEvent('email_send_failed', {
+        recipient: normalizedTo,
+        subject,
+        attempt,
+        totalAttempts: retries + 1,
         cause: classification.cause,
         diagnosis: classification.diagnosis,
         reason: classification.reason,
@@ -229,12 +272,10 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
       });
 
       if (isLastAttempt) {
-        console.error(`❌ All ${retries + 1} attempts failed for ${normalizedTo}`);
         return false;
       }
 
       const delay = attempt * 1000;
-      console.log(`   Retrying in ${delay}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
@@ -1079,78 +1120,58 @@ if (config.SUPABASE_URL && config.SUPABASE_KEY) {
   try {
     supabase = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
     console.log('✅ Supabase client initialized');
-    // Wire realtime listeners to forward DB events to connected admin SSE clients
-    try {
-      if (typeof supabase.channel !== 'function') {
-        console.warn('⚠️ Supabase client does not expose realtime channel API; skipping realtime subscription.');
-      } else {
-        const channel = supabase.channel('realtime_events');
-        try {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_chat_messages' }, (payload) => {
-            try { broadcastAdminEvent('chat_message', payload.record || payload); } catch (e) { /* ignore */ }
-          });
-        } catch (e) { console.warn('⚠️ Failed to attach listener for chat_messages:', e && (e.message || e)); }
-        try {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_chat_conversations' }, (payload) => {
-            try { broadcastAdminEvent('chat_conversation', payload.record || payload); } catch (e) { /* ignore */ }
-          });
-        } catch (e) { console.warn('⚠️ Failed to attach listener for chat_conversations:', e && (e.message || e)); }
-        try {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_orders' }, (payload) => {
-            try { broadcastAdminEvent('order', payload.record || payload); } catch (e) { /* ignore */ }
-          });
-        } catch (e) { console.warn('⚠️ Failed to attach listener for matex_orders:', e && (e.message || e)); }
 
-        (async () => {
-          try {
-            const status = await channel.subscribe();
-            if (status && status.error) {
-              console.warn('⚠️ Supabase realtime subscribe returned error:', status.error);
-            } else {
-              console.log('✅ Supabase realtime channel subscribed');
-            }
-          } catch (err) {
-            console.warn('⚠️ Supabase realtime subscription failed:', err && (err.message || err));
-          }
-        })();
-      }
-      if (typeof supabase.channel !== 'function') {
+    async function initializeRealtimeSubscriptions() {
+      if (typeof supabase?.channel !== 'function') {
         console.warn('⚠️ Supabase client does not expose realtime channel API; skipping realtime subscription.');
-      } else {
-        const channel = supabase.channel('realtime_events');
-        try {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_chat_messages' }, (payload) => {
-            try { broadcastAdminEvent('chat_message', payload.record || payload); } catch (e) { /* ignore */ }
-          });
-        } catch (e) { console.warn('⚠️ Failed to attach listener for chat_messages:', e && (e.message || e)); }
-        try {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_chat_conversations' }, (payload) => {
-            try { broadcastAdminEvent('chat_conversation', payload.record || payload); } catch (e) { /* ignore */ }
-          });
-        } catch (e) { console.warn('⚠️ Failed to attach listener for chat_conversations:', e && (e.message || e)); }
-        try {
-          channel.on('postgres_changes', { event: '*', schema: 'public', table: 'matex_orders' }, (payload) => {
-            try { broadcastAdminEvent('order', payload.record || payload); } catch (e) { /* ignore */ }
-          });
-        } catch (e) { console.warn('⚠️ Failed to attach listener for matex_orders:', e && (e.message || e)); }
-
-        (async () => {
-          try {
-            const status = await channel.subscribe();
-            if (status && status.error) {
-              console.warn('⚠️ Supabase realtime subscribe returned error:', status.error);
-            } else {
-              console.log('✅ Supabase realtime channel subscribed');
-            }
-          } catch (err) {
-            console.warn('⚠️ Supabase realtime subscription failed:', err && (err.message || err));
-          }
-        })();
+        return;
       }
-    } catch (e) {
-      console.warn('⚠️ Failed to initialize Supabase realtime channel (outer):', e && (e.message || e));
-      console.warn('⚠️ Failed to initialize Supabase realtime channel (outer):', e && (e.message || e));
+
+      const channel = supabase.channel('matex_realtime_events', {
+        config: {
+          broadcast: { self: false },
+          presence: { key: 'admin' }
+        }
+      });
+
+      const subscriptions = [
+        { table: 'matex_chat_messages', eventName: 'chat_message' },
+        { table: 'matex_chat_conversations', eventName: 'chat_conversation' },
+        { table: 'matex_orders', eventName: 'order' },
+        { table: 'matex_reviews', eventName: 'review' },
+        { table: 'matex_notifications', eventName: 'notification' }
+      ];
+
+      subscriptions.forEach(({ table, eventName }) => {
+        try {
+          channel.on('postgres_changes', { event: '*', schema: 'public', table }, (payload) => {
+            try {
+              const record = payload?.new ?? payload?.record ?? payload;
+              broadcastAdminEvent(eventName, record);
+            } catch (e) {
+              console.warn(`⚠️ Failed to broadcast realtime event for ${table}:`, e && (e.message || e));
+            }
+          });
+        } catch (e) {
+          console.warn(`⚠️ Failed to attach listener for ${table}:`, e && (e.message || e));
+        }
+      });
+
+      try {
+        const status = await channel.subscribe();
+        if (status && status.error) {
+          console.warn('⚠️ Supabase realtime subscribe returned error:', status.error);
+        } else {
+          console.log('✅ Supabase realtime channel subscribed');
+        }
+      } catch (err) {
+        console.warn('⚠️ Supabase realtime subscription failed:', err && (err.message || err));
+      }
     }
+
+    initializeRealtimeSubscriptions().catch((err) => {
+      console.warn('⚠️ Failed to initialize Supabase realtime channel:', err && (err.message || err));
+    });
   } catch (err) {
     console.error('Supabase initialization failed:', err.message);
     supabase = null;

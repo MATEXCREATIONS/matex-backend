@@ -132,7 +132,6 @@ function serializeSmtpError(err) {
 async function ensureTransporterVerified() {
   if (!emailTransporter) {
     smtpTransporterVerified = false;
-    smtpTransporterVerified = false;
     return {
       success: false,
       cause: 'Missing Environment Variable',
@@ -148,7 +147,6 @@ async function ensureTransporterVerified() {
   const configCause = getSmtpConfigurationCause();
   if (configCause.cause !== 'ok') {
     smtpTransporterVerified = false;
-    smtpTransporterVerified = false;
     return {
       success: false,
       cause: configCause.cause,
@@ -161,14 +159,12 @@ async function ensureTransporterVerified() {
     const verifyPromise = emailTransporter.verify();
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
-      setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
     );
     
     await Promise.race([verifyPromise, timeoutPromise]);
     smtpTransporterVerified = true;
     return { success: true };
   } catch (err) {
-    smtpTransporterVerified = false;
     smtpTransporterVerified = false;
     const classification = classifySmtpError(err);
     return {
@@ -177,7 +173,6 @@ async function ensureTransporterVerified() {
       diagnosis: classification.diagnosis,
       reason: classification.reason,
       error: err?.message || String(err),
-      errorFull: serializeSmtpError(err),
       errorFull: serializeSmtpError(err),
       errorCode: err?.code || null,
       command: err?.command || null
@@ -234,7 +229,6 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
       });
 
       if (isLastAttempt) {
-        console.error(`❌ All ${retries + 1} attempts failed for ${normalizedTo}`);
         console.error(`❌ All ${retries + 1} attempts failed for ${normalizedTo}`);
         return false;
       }
@@ -306,7 +300,6 @@ async function runSmtpDiagnostics(targetEmail) {
     smtpSecure: SMTP_SECURE,
     smtpUser: SMTP_USER || null,
     smtpFrom: config.SMTP_FROM || null,
-    smtpFrom: config.SMTP_FROM || null,
     hasSMTPPass,
     configCause: configStatus.cause,
     configMessage: configStatus.message,
@@ -314,12 +307,9 @@ async function runSmtpDiagnostics(targetEmail) {
     authenticationSuccess: false,
     realSendAttempted: false,
     realSendSuccess: false,
-    realSendAttempted: false,
-    realSendSuccess: false,
     diagnosis: configStatus.cause,
     reason: configStatus.message,
     targetEmail: typeof targetEmail === 'string' ? targetEmail.trim() : ''
-  };
   };
 
   if (configStatus.cause !== 'ok') {
@@ -335,21 +325,10 @@ async function runSmtpDiagnostics(targetEmail) {
   }
 
   try {
-  const transporter = emailTransporter || nodemailer.createTransport(Object.assign({}, smtpConfig, { tls: { rejectUnauthorized: false } }));
-  const testAddress = diagnostics.targetEmail || SMTP_USER || DESIGNER_EMAIL || null;
-  if (!testAddress) {
-    diagnostics.diagnosis = 'No valid target email address for test send.';
-    diagnostics.reason = 'Set SMTP_USER, DESIGNER_EMAIL, or provide a target email when running diagnostics.';
-    return diagnostics;
-  }
-
-  try {
     const verifyPromise = transporter.verify();
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
-      setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
     );
-
 
     await Promise.race([verifyPromise, timeoutPromise]);
     diagnostics.connectionSuccess = true;
@@ -365,51 +344,8 @@ async function runSmtpDiagnostics(targetEmail) {
     diagnostics.reason = classification.reason;
     diagnostics.error = err?.message || String(err);
     diagnostics.errorFull = serializeSmtpError(err);
-    diagnostics.errorFull = serializeSmtpError(err);
     diagnostics.errorCode = err?.code || null;
     diagnostics.errorCommand = err?.command || null;
-    if (['Render outbound connection issue', 'Wrong Port', 'Wrong Host'].includes(diagnostics.cause)) {
-      diagnostics.suggestedAction = 'Verify network egress and SMTP host/port; some hosts block outbound SMTP. Try a transactional email provider or alternate port.';
-    }
-    return diagnostics;
-  }
-
-  diagnostics.realSendAttempted = true;
-  try {
-    const mailOptions = {
-      from: config.SMTP_FROM || SMTP_USER || NOREPLY_EMAIL,
-      to: testAddress,
-      subject: 'Matex SMTP Connectivity Test',
-      text: 'This is a connectivity test message sent by the Matex backend. If you receive this, SMTP is working.',
-      html: `<p>This is a connectivity test message sent by the Matex backend. If you receive this, SMTP is working.</p><p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>`
-    };
-
-    const sendPromise = transporter.sendMail(mailOptions);
-    const sendTimeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('SMTP send timeout (>60s)')), 60000)
-    );
-
-    const info = await Promise.race([sendPromise, sendTimeout]);
-    diagnostics.realSendSuccess = true;
-    diagnostics.emailInfo = {
-      messageId: info?.messageId || null,
-      response: info?.response || null
-    };
-    diagnostics.diagnosis = 'SMTP verify and real send succeeded.';
-    diagnostics.reason = `Test email sent to ${testAddress}.`;
-  } catch (err) {
-    const classification = classifySmtpError(err);
-    diagnostics.realSendSuccess = false;
-    diagnostics.cause = classification.cause;
-    diagnostics.diagnosis = classification.diagnosis;
-    diagnostics.reason = classification.reason;
-    diagnostics.error = err?.message || String(err);
-    diagnostics.errorFull = serializeSmtpError(err);
-    diagnostics.errorCode = err?.code || null;
-    diagnostics.errorCommand = err?.command || null;
-    if (diagnostics.cause === 'Render outbound connection issue' || diagnostics.cause === 'Wrong Port' || diagnostics.cause === 'Wrong Host') {
-      diagnostics.suggestedAction = 'Real send failed; suspect network connectivity or blocked SMTP egress.';
-    }
     if (['Render outbound connection issue', 'Wrong Port', 'Wrong Host'].includes(diagnostics.cause)) {
       diagnostics.suggestedAction = 'Verify network egress and SMTP host/port; some hosts block outbound SMTP. Try a transactional email provider or alternate port.';
     }
@@ -1090,27 +1026,6 @@ async function persistOrder(order) {
       } catch (e2) {
         console.error('❌ Supabase persistOrder sanitized retry exception for', record.order_id, e2 && (e2.message || e2));
       }
-    let persisted = merged;
-    try {
-      const { data, error } = await supabase.from('matex_orders').upsert([merged], { onConflict: 'order_id' }).select();
-      if (error) throw error;
-      persisted = Array.isArray(data) && data.length > 0 ? data[0] : merged;
-    } catch (upsertErr) {
-      console.error('❌ Supabase persistOrder upsert error for', record.order_id, upsertErr && (upsertErr.message || upsertErr));
-      // Attempt a sanitized retry to tolerate schema drift (missing optional columns)
-      try {
-        const sanitized = Object.assign({}, merged);
-        ['revisions_allowed', 'revisions_used', 'revisions_remaining', 'revision_count'].forEach(f => { if (Object.prototype.hasOwnProperty.call(sanitized, f)) delete sanitized[f]; });
-        const { data: data2, error: error2 } = await supabase.from('matex_orders').upsert([sanitized], { onConflict: 'order_id' }).select();
-        if (!error2 && Array.isArray(data2) && data2.length > 0) {
-          persisted = data2[0];
-          console.log('✅ Supabase persistOrder sanitized upsert succeeded for', record.order_id);
-        } else if (error2) {
-          console.error('❌ Supabase persistOrder sanitized upsert failed for', record.order_id, error2);
-        }
-      } catch (e2) {
-        console.error('❌ Supabase persistOrder sanitized retry exception for', record.order_id, e2 && (e2.message || e2));
-      }
       try { broadcastAdminEvent('order', record); } catch (e) {}
     }
     console.log('✅ Order persisted to Supabase:', record.order_id);
@@ -1358,7 +1273,6 @@ app.get('/', (req, res) => {
 
 // Health check under the /api prefix for consistency with API routes
 app.get('/health', (req, res) => {
-app.get('/health', (req, res) => {
   const smtpConfigured = Boolean(emailTransporter);
   const smtpConfiguration = getSmtpConfigurationCause();
 
@@ -1384,27 +1298,6 @@ app.get('/api/health', (req, res) => {
     success: true,
     message: 'Matex API healthy',
     timestamp: new Date().toISOString(),
-    supabaseConfigured: Boolean(supabase),
-    supabaseOnline: null,
-    supabaseCheck: null,
-    smtpConfigured,
-    smtpVerified: smtpTransporterVerified,
-    smtpConfiguration,
-    adminEventsConnected: adminEventClients.size
-  });
-});
-
-app.get('/api/health', (req, res) => {
-  const smtpConfigured = Boolean(emailTransporter);
-  const smtpConfiguration = getSmtpConfigurationCause();
-
-  return res.json({
-    success: true,
-    message: 'Matex API healthy',
-    timestamp: new Date().toISOString(),
-    supabaseConfigured: Boolean(supabase),
-    supabaseOnline: null,
-    supabaseCheck: null,
     supabaseConfigured: Boolean(supabase),
     supabaseOnline: null,
     supabaseCheck: null,
@@ -2515,11 +2408,11 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
           try {
             await sendEmail(DESIGNER_EMAIL, `New Order - ${updatedOrder.order_id}`, designerHtml);
           } catch (err) {
-          try {
-            await sendEmail(DESIGNER_EMAIL, `New Order - ${updatedOrder.order_id}`, designerHtml);
-          } catch (err) {
-            console.error('Designer notification failed:', err?.message || err);
-          }
+            try {
+              await sendEmail(DESIGNER_EMAIL, `New Order - ${updatedOrder.order_id}`, designerHtml);
+            } catch (err2) {
+              console.error('Designer notification failed:', err2?.message || err2);
+            }
           }
         }
         if (customerEmail) {
@@ -2595,15 +2488,6 @@ app.post('/api/payment/webhook', express.raw({ type: 'application/json' }), asyn
       }
     } catch (sigErr) {
       console.warn('⚠️ Paystack signature verification failed:', sigErr && (sigErr.message || sigErr));
-    try {
-      const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(rawForSig).digest('hex');
-      if (!signature || signature !== expected) {
-        console.warn('⚠️ Invalid Paystack signature');
-        return res.status(400).send('invalid signature');
-      }
-    } catch (sigErr) {
-      console.warn('⚠️ Paystack signature verification failed:', sigErr && (sigErr.message || sigErr));
-      return res.status(400).send('invalid signature');
     }
 
     const event = (Buffer.isBuffer(req.body) || typeof req.body === 'string') ? JSON.parse(rawForSig.toString('utf8')) : req.body;
@@ -2665,21 +2549,11 @@ app.post('/api/payment/webhook', express.raw({ type: 'application/json' }), asyn
         const merged = Object.assign({}, existing || {}, updatePayload, {
           amount: amountValue
         });
-        const amountValue = (existing && typeof existing.amount === 'number')
-          ? existing.amount
-          : (isNaN(amountPaid) ? null : amountPaid);
-
-        const merged = Object.assign({}, existing || {}, updatePayload, {
-          amount: amountValue
-        });
         if (typeof merged.amount === 'number' && typeof merged.amount_paid === 'number') {
           merged.amount_remaining = Math.max(merged.amount - merged.amount_paid, 0);
         }
         if (!merged.order_id) merged.order_id = orderId || reference || merged.order_id || reference;
 
-        const persistedOrder = await persistOrder(merged);
-        if (persistedOrder && persistedOrder.order_id) {
-          console.log('✅ Supabase persistOrder (webhook) completed for:', persistedOrder.order_id);
         const persistedOrder = await persistOrder(merged);
         if (persistedOrder && persistedOrder.order_id) {
           console.log('✅ Supabase persistOrder (webhook) completed for:', persistedOrder.order_id);
@@ -2731,13 +2605,6 @@ async function trackOrderHandler(req, res) {
     }
   } catch (err) {
     console.error('Track order error:', err.message || err);
-  try {
-    const order = await loadOrderById(normalizedOrderId);
-    if (order) {
-      return res.json({ success: true, order });
-    }
-  } catch (err) {
-    console.error('Track order error:', err.message || err);
     console.warn('Falling back to in-memory order store for tracking', normalizedOrderId);
   }
 
@@ -2753,14 +2620,6 @@ app.get('/api/orders/track/:orderId', trackOrderHandler);
 app.get('/api/track-order/:orderId', trackOrderHandler);
 app.get('/track-order/:orderId', trackOrderHandler);
 
-app.get('/api/orders/:orderId', async (req, res) => {
-  const orderId = String(req.params.orderId || '').trim();
-  console.log(`📍 GET /api/orders/${orderId} - Fetch order`);
-  if (!orderId) {
-    return res.status(400).json({ success: false, message: 'orderId is required' });
-  }
-  const order = await loadOrderById(orderId);
-  if (!order) {
 app.get('/api/orders/:orderId', async (req, res) => {
   const orderId = String(req.params.orderId || '').trim();
   console.log(`📍 GET /api/orders/${orderId} - Fetch order`);
@@ -2925,14 +2784,6 @@ app.put('/api/admin/orders/:orderId/status', adminAuth, async (req, res) => {
       const updatedHistory = [...existingHistory, newHistoryEntry];
 
       try {
-        const updatedData = await persistOrder({
-          order_id: orderId,
-          order_status: status,
-          latest_progress: statusNote,
-          status_history: updatedHistory
-        });
-        if (updatedData) {
-          updatedOrder = updatedData;
         const updatedData = await persistOrder({
           order_id: orderId,
           order_status: status,
@@ -3542,7 +3393,6 @@ app.post('/api/revisions/request', async (req, res) => {
 
   try {
     let order = await loadOrderById(order_id);
-    let order = await loadOrderById(order_id);
     if (!order) {
       order = orderStore.get(order_id);
     }
@@ -3577,7 +3427,6 @@ app.post('/api/revisions/request', async (req, res) => {
     };
 
     const timelineEntry = { event: 'Revision Requested', message: String(customer_message).trim(), updated_at: new Date().toISOString() };
-    const timelineEntry = { event: 'Revision Requested', message: String(customer_message).trim(), updated_at: new Date().toISOString() };
     if (supabase) {
       const { data, error } = await supabase.from('matex_revisions').insert([revisionRecord]).select();
       if (error) {
@@ -3585,20 +3434,6 @@ app.post('/api/revisions/request', async (req, res) => {
         return res.status(500).json({ success: false, message: 'Failed to save revision request' });
       }
       revisionRecord.id = data[0].id;
-
-      const existingRes = await supabase.from('matex_orders').select('status_history').eq('order_id', order_id).limit(1).maybeSingle();
-      const history = existingRes && !existingRes.error && Array.isArray(existingRes.data?.status_history) ? existingRes.data.status_history : [];
-      const orderUpdate = {
-        order_id,
-        revisions_used: nextUsed,
-        revisions_remaining: nextRemaining,
-        revision_count: revisionsAllowed,
-        latest_progress: 'Revision requested by customer',
-        status_history: [...history, timelineEntry]
-      };
-      await persistOrder(orderUpdate).catch((updateErr) => {
-        console.warn('Supabase revision request order update warning:', updateErr?.message || updateErr);
-      });
 
       const existingRes = await supabase.from('matex_orders').select('status_history').eq('order_id', order_id).limit(1).maybeSingle();
       const history = existingRes && !existingRes.error && Array.isArray(existingRes.data?.status_history) ? existingRes.data.status_history : [];
@@ -3801,27 +3636,6 @@ app.put('/api/revisions/:revisionId/approve', adminAuth, async (req, res) => {
         return res.status(500).json({ success: false, message: 'Failed to update revision' });
       }
 
-      const existingOrder = await loadOrderById(revision.order_id);
-      const history = Array.isArray(existingOrder?.status_history) ? existingOrder.status_history : [];
-      const timelineEntry = { event: 'Revision Approved', message: 'Revision approved by admin', updated_at: new Date().toISOString() };
-
-      await persistOrder({
-        order_id: revision.order_id,
-        revisions_used: updatedRevision.revisions_used,
-        revisions_remaining: updatedRevision.revisions_remaining,
-        latest_progress: 'Revision approved by admin',
-        status_history: [...history, timelineEntry]
-      }).catch((persistErr) => {
-        console.warn('Supabase revision approval order update warning:', persistErr?.message || persistErr);
-      });
-    } else {
-      const existingOrder = orderStore.get(revision.order_id) || {};
-      existingOrder.revisions_used = updatedRevision.revisions_used;
-      existingOrder.revisions_remaining = updatedRevision.revisions_remaining;
-      existingOrder.latest_progress = 'Revision approved by admin';
-      const history = Array.isArray(existingOrder.status_history) ? existingOrder.status_history : [];
-      existingOrder.status_history = [...history, { event: 'Revision Approved', message: 'Revision approved by admin', updated_at: new Date().toISOString() }];
-      orderStore.set(revision.order_id, existingOrder);
       const existingOrder = await loadOrderById(revision.order_id);
       const history = Array.isArray(existingOrder?.status_history) ? existingOrder.status_history : [];
       const timelineEntry = { event: 'Revision Approved', message: 'Revision approved by admin', updated_at: new Date().toISOString() };

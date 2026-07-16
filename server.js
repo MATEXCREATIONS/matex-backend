@@ -71,12 +71,13 @@ const SMTP_PASS = config.SMTP_PASS;
 const SENDGRID_API_KEY = config.SENDGRID_API_KEY;
 const EMAIL_PROVIDER = config.EMAIL_PROVIDER;
 const isSendGridProvider = EMAIL_PROVIDER === 'sendgrid' && Boolean(SENDGRID_API_KEY);
+const isSmtpProvider = EMAIL_PROVIDER === 'smtp';
 const hasSMTPPass = Boolean(SMTP_PASS);
 
 const smtpConfig = config.smtpConfig;
 
-function getSmtpConfigurationCause() {
-  return config.getSmtpConfigurationCause();
+function getEmailConfigurationCause() {
+  return config.getEmailConfigurationCause();
 }
 
 if (EMAIL_PROVIDER === 'sendgrid') {
@@ -108,7 +109,7 @@ if (EMAIL_PROVIDER === 'sendgrid') {
       console.log(`   SMTP_USER: ${SMTP_USER || '(not set)'}`);
       console.log(`   SMTP_FROM: ${config.SMTP_FROM}`);
       console.log(`   hasSMTPPass: ${hasSMTPPass}`);
-      const configCheck = getSmtpConfigurationCause();
+      const configCheck = getEmailConfigurationCause();
       if (configCheck.cause !== 'ok') {
         console.warn(`   SMTP configuration warning: ${configCheck.cause} - ${configCheck.message}`);
       }
@@ -144,7 +145,7 @@ async function ensureTransporterVerified() {
     return { success: true };
   }
 
-  const configCause = getSmtpConfigurationCause();
+  const configCause = getEmailConfigurationCause();
   if (configCause.cause !== 'ok') {
     smtpTransporterVerified = false;
     return {
@@ -178,7 +179,7 @@ async function ensureTransporterVerified() {
       diagnosis: classification.diagnosis,
       reason: classification.reason,
       error: err?.message || String(err),
-      errorFull: serializeSmtpError(err),
+      errorFull: serializeEmailError(err),
       errorCode: err?.code || null,
       command: err?.command || null
     };
@@ -197,6 +198,38 @@ function logEmailEvent(event, details = {}) {
   } else {
     console.log('[email]', JSON.stringify(payload));
   }
+}
+
+function serializeEmailError(err) {
+  if (!err) return null;
+  const serialized = {
+    message: err.message || String(err),
+    code: err.code || null,
+    command: err.command || null,
+    response: err.response || null,
+    responseCode: err.responseCode || null,
+    statusCode: err.statusCode || null,
+    headers: err.headers || null,
+    stack: err.stack || null
+  };
+
+  for (const key of Object.getOwnPropertyNames(err)) {
+    if (!(key in serialized)) {
+      serialized[key] = err[key];
+    }
+  }
+
+  return serialized;
+}
+
+// Legacy alias preserved for backward compatibility in case any SMTP-specific code paths still reference the older helper name.
+const serializeSmtpError = serializeEmailError;
+
+function withTimeout(promise, timeoutMs, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs))
+  ]);
 }
 
 // Helper: Send email with retry logic
@@ -222,7 +255,7 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
     return false;
   }
 
-  const configCause = getSmtpConfigurationCause();
+  const configCause = getEmailConfigurationCause();
   if (configCause.cause !== 'ok') {
     logEmailEvent('email_send_failed', {
       reason: 'invalid_email_configuration',
@@ -263,10 +296,7 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
         });
       }
 
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('SMTP send timeout (>60s)')), 60000)
-      );
-      const result = await Promise.race([sendPromise, timeoutPromise]);
+      const result = await withTimeout(sendPromise, 60000, 'Email send timeout (>60s)');
       smtpTransporterVerified = true;
       logEmailEvent('email_send_success', {
         recipient: normalizedTo,
@@ -289,7 +319,7 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
         cause: classification.cause,
         diagnosis: classification.diagnosis,
         reason: classification.reason,
-        error: serializeSmtpError(err)
+        error: serializeEmailError(err)
       });
 
       if (isLastAttempt) {
@@ -355,7 +385,7 @@ function classifySmtpError(err) {
 }
 
 async function runSmtpDiagnostics(targetEmail) {
-  const configStatus = getSmtpConfigurationCause();
+  const configStatus = getEmailConfigurationCause();
   const diagnostics = {
     provider: EMAIL_PROVIDER,
     smtpHost: SMTP_HOST,
@@ -397,12 +427,7 @@ async function runSmtpDiagnostics(targetEmail) {
       diagnostics.diagnosis = 'SendGrid provider configured. No SMTP handshake required.';
       diagnostics.reason = 'SendGrid API key is configured.';
     } else {
-      const verifyPromise = transporter.verify();
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
-      );
-
-      await Promise.race([verifyPromise, timeoutPromise]);
+      await withTimeout(transporter.verify(), 60000, 'SMTP verification timeout (>60s)');
       diagnostics.connectionSuccess = true;
       diagnostics.authenticationSuccess = true;
       diagnostics.diagnosis = 'SMTP connection and authentication succeeded.';
@@ -416,7 +441,7 @@ async function runSmtpDiagnostics(targetEmail) {
     diagnostics.diagnosis = classification.diagnosis;
     diagnostics.reason = classification.reason;
     diagnostics.error = err?.message || String(err);
-    diagnostics.errorFull = serializeSmtpError(err);
+    diagnostics.errorFull = serializeEmailError(err);
     diagnostics.errorCode = err?.code || null;
     diagnostics.errorCommand = err?.command || null;
     if (['Render outbound connection issue', 'Wrong Port', 'Wrong Host'].includes(diagnostics.cause)) {
@@ -443,11 +468,7 @@ async function runSmtpDiagnostics(targetEmail) {
       sendPromise = transporter.sendMail(mailOptions);
     }
 
-    const sendTimeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('SMTP send timeout (>60s)')), 60000)
-    );
-
-    const info = await Promise.race([sendPromise, sendTimeout]);
+    const info = await withTimeout(sendPromise, 60000, 'Email send timeout (>60s)');
     diagnostics.realSendSuccess = true;
     diagnostics.emailInfo = {
       messageId: info?.[0]?.messageId || info?.messageId || null,
@@ -464,7 +485,7 @@ async function runSmtpDiagnostics(targetEmail) {
     diagnostics.diagnosis = classification.diagnosis;
     diagnostics.reason = classification.reason;
     diagnostics.error = err?.message || String(err);
-    diagnostics.errorFull = serializeSmtpError(err);
+    diagnostics.errorFull = serializeEmailError(err);
     diagnostics.errorCode = err?.code || null;
     diagnostics.errorCommand = err?.command || null;
     if (diagnostics.cause === 'Render outbound connection issue' || diagnostics.cause === 'Wrong Port' || diagnostics.cause === 'Wrong Host') {
@@ -1336,7 +1357,7 @@ app.get('/', (req, res) => {
 // Health check under the /api prefix for consistency with API routes
 app.get('/health', (req, res) => {
   const smtpConfigured = isSendGridProvider || Boolean(emailTransporter);
-  const smtpConfiguration = getSmtpConfigurationCause();
+  const smtpConfiguration = getEmailConfigurationCause();
 
   return res.json({
     success: true,
@@ -1355,7 +1376,7 @@ app.get('/health', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   const smtpConfigured = isSendGridProvider || Boolean(emailTransporter);
-  const smtpConfiguration = getSmtpConfigurationCause();
+  const smtpConfiguration = getEmailConfigurationCause();
 
   return res.json({
     success: true,
@@ -3023,7 +3044,7 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
     const { testEmail } = req.body || {};
     const targetEmail = (testEmail && String(testEmail).trim()) || DESIGNER_EMAIL || SMTP_USER || '';
 
-    const configCheck = getSmtpConfigurationCause();
+    const configCheck = getEmailConfigurationCause();
     const result = {
       timestamp: new Date().toISOString(),
       configuration: {

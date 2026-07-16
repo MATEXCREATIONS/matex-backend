@@ -185,6 +185,20 @@ async function ensureTransporterVerified() {
   }
 }
 
+function logEmailEvent(event, details = {}) {
+  const payload = {
+    event,
+    timestamp: new Date().toISOString(),
+    ...details
+  };
+
+  if (event.endsWith('_failed')) {
+    console.error('[email]', JSON.stringify(payload));
+  } else {
+    console.log('[email]', JSON.stringify(payload));
+  }
+}
+
 // Helper: Send email with retry logic
 async function sendEmail(to, subject, html, fromEmail, retries = 2) {
   const normalizedTo = typeof to === 'string' ? to.trim() : '';
@@ -343,6 +357,7 @@ function classifySmtpError(err) {
 async function runSmtpDiagnostics(targetEmail) {
   const configStatus = getSmtpConfigurationCause();
   const diagnostics = {
+    provider: EMAIL_PROVIDER,
     smtpHost: SMTP_HOST,
     smtpPort: SMTP_PORT,
     smtpSecure: SMTP_SECURE,
@@ -2960,8 +2975,8 @@ app.post('/api/admin/email-test', adminAuth, async (req, res) => {
         success: diagnosticsResult.connectionSuccess && diagnosticsResult.authenticationSuccess,
         diagnostics: diagnosticsResult,
         message: diagnosticsResult.connectionSuccess && diagnosticsResult.authenticationSuccess
-          ? 'SMTP diagnostics passed.'
-          : 'SMTP diagnostics failed.'
+          ? `${EMAIL_PROVIDER === 'sendgrid' ? 'SendGrid' : 'SMTP'} diagnostics passed.`
+          : `${EMAIL_PROVIDER === 'sendgrid' ? 'SendGrid' : 'SMTP'} diagnostics failed.`
       });
     }
 
@@ -3012,11 +3027,14 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
     const result = {
       timestamp: new Date().toISOString(),
       configuration: {
+        provider: EMAIL_PROVIDER,
         smtpHost: SMTP_HOST,
         smtpPort: SMTP_PORT,
         smtpSecure: SMTP_SECURE,
         smtpUserConfigured: !!SMTP_USER,
         smtpPassConfigured: hasSMTPPass,
+        sendGridApiKeyConfigured: !!SENDGRID_API_KEY,
+        emailProviderConfigured: isSendGridProvider || Boolean(emailTransporter),
         configCause: configCheck.cause,
         configMessage: configCheck.message,
         designerEmail: DESIGNER_EMAIL,
@@ -3024,6 +3042,8 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
         transporterExists: !!emailTransporter
       },
       environmentVariables: {
+        EMAIL_PROVIDER: EMAIL_PROVIDER ? `✅ ${EMAIL_PROVIDER}` : '❌ Not set',
+        SENDGRID_API_KEY: SENDGRID_API_KEY ? '✅ Set' : '❌ Not set',
         SMTP_HOST: SMTP_HOST ? '✅ Set' : '❌ Not set',
         SMTP_PORT: SMTP_PORT ? '✅ Set' : '❌ Not set',
         SMTP_USER: SMTP_USER ? '✅ Set' : '❌ Not set',
@@ -3055,6 +3075,9 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
       result.smtpVerification.message = result.smtpVerification.diagnosis;
       return res.status(500).json({ success: false, diagnostics: result });
     }
+
+    result.configuration.emailProviderConfigured = true;
+    result.configuration.provider = EMAIL_PROVIDER;
 
     const diagnostics = await runSmtpDiagnostics(typeof targetEmail === 'string' ? targetEmail : '');
     result.smtpVerification = {

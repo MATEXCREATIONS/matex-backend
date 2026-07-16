@@ -1424,6 +1424,34 @@ app.get('/api/admin/orders', adminAuth, async (req, res) => {
   }
 });
 
+app.get('/api/admin/orders/:orderId', adminAuth, async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  console.log(`📍 GET /api/admin/orders/${orderId} - Fetch single order`);
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: 'orderId is required' });
+  }
+
+  try {
+    let order = null;
+    if (supabase) {
+      const { data, error } = await supabase.from('matex_orders').select('*').eq('order_id', orderId).limit(1).maybeSingle();
+      if (!error && data) {
+        order = data;
+      }
+    }
+    if (!order) {
+      order = orderStore.get(orderId) || null;
+    }
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    return res.json({ success: true, order });
+  } catch (err) {
+    console.error('Admin fetch order error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to fetch order' });
+  }
+});
+
 app.put('/api/admin/orders/:orderId', adminAuth, async (req, res) => {
   console.log(`📍 PUT /api/admin/orders/${req.params.orderId} - Updating order`);
   try {
@@ -2181,11 +2209,18 @@ app.post('/api/assistant/query', async (req, res) => {
  */
 app.post('/api/payment/initialize', async (req, res) => {
   console.log('📍 POST /api/payment/initialize - Payment initialization');
-  try {
-    const { order_id, email, amount, service_name, payment_type, callback_url } = req.body;
+  if (!PAYSTACK_SECRET_KEY) {
+    return res.status(503).json({
+      success: false,
+      message: 'Paystack is not configured. Set PAYSTACK_SECRET_KEY in the environment.'
+    });
+  }
 
-    // Validation
-    if (!order_id || !email || !amount || !service_name || !payment_type) {
+  try {
+    const { order_id, email, amount, amount_kobo, service_name, payment_type, callback_url } = req.body;
+
+    // Validation: accept either `amount` (Naira) or `amount_kobo` (integer)
+    if (!order_id || !email || (!(amount || amount_kobo)) || !service_name || !payment_type) {
       return res.status(400).json({
         success: false,
         message: 'Missing required fields: order_id, email, amount, service_name, payment_type'
@@ -2197,8 +2232,15 @@ app.post('/api/payment/initialize', async (req, res) => {
       console.log('🔗 Using Paystack callback_url:', callback_url);
     }
 
-    // Ensure amount is a valid number and convert to kobo
-    const amountInKobo = Math.round(Number(amount) * 100);
+    // Determine amount in kobo: prefer explicit amount_kobo from client (unambiguous), otherwise convert Naira->kobo
+    let amountInKobo;
+    if (amount_kobo != null && !isNaN(Number(amount_kobo))) {
+      amountInKobo = Math.round(Number(amount_kobo));
+      console.log('🔍 Payment amount debug - incoming amount_kobo provided by client:', amount_kobo, 'using amountInKobo:', amountInKobo);
+    } else {
+      amountInKobo = Math.round(Number(amount) * 100);
+      console.log('🔍 Payment amount debug - incoming amount (Naira):', amount, 'typeof:', typeof amount, 'amountInKobo:', amountInKobo);
+    }
     if (isNaN(amountInKobo) || amountInKobo <= 0) {
       return res.status(400).json({
         success: false,
@@ -2234,11 +2276,17 @@ app.post('/api/payment/initialize', async (req, res) => {
 
     if (response.data.status) {
       const payload = response.data.data;
-      console.log('🔔 Paystack initialize response:', {
-        reference: payload.reference,
-        access_code: payload.access_code,
-        authorization_url: payload.authorization_url
-      });
+      // Log amount returned by Paystack (if present) to cross-check unit conversions
+      try {
+        console.log('🔔 Paystack initialize response:', {
+          reference: payload.reference,
+          access_code: payload.access_code,
+          authorization_url: payload.authorization_url,
+          amount_from_paystack: payload.amount || null
+        });
+      } catch (e) {
+        console.log('🔔 Paystack initialize response (partial):', { reference: payload.reference, access_code: payload.access_code, authorization_url: payload.authorization_url });
+      }
       const existingOrder = orderStore.get(order_id) || {};
       const orderData = Object.assign({}, existingOrder, {
         order_id,
@@ -2306,6 +2354,13 @@ app.post('/api/payment/initialize', async (req, res) => {
  */
 app.get('/api/payment/verify/:reference', async (req, res) => {
   console.log(`📍 GET /api/payment/verify/:reference - Payment verification`);
+  if (!PAYSTACK_SECRET_KEY) {
+    return res.status(503).json({
+      success: false,
+      message: 'Paystack is not configured. Set PAYSTACK_SECRET_KEY in the environment.'
+    });
+  }
+
   const { reference } = req.params;
   console.log('✅ Verification route hit for reference:', reference);
 

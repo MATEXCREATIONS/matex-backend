@@ -3,6 +3,7 @@ import cors from 'cors';
 import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
+import sgMail from '@sendgrid/mail';
 import multer from 'multer';
 import crypto from 'crypto';
 import path from 'path';
@@ -67,6 +68,9 @@ const SMTP_PORT = config.SMTP_PORT;
 const SMTP_SECURE = config.SMTP_SECURE;
 const SMTP_USER = config.SMTP_USER;
 const SMTP_PASS = config.SMTP_PASS;
+const SENDGRID_API_KEY = config.SENDGRID_API_KEY;
+const EMAIL_PROVIDER = config.EMAIL_PROVIDER;
+const isSendGridProvider = EMAIL_PROVIDER === 'sendgrid' && Boolean(SENDGRID_API_KEY);
 const hasSMTPPass = Boolean(SMTP_PASS);
 
 const smtpConfig = config.smtpConfig;
@@ -75,76 +79,58 @@ function getSmtpConfigurationCause() {
   return config.getSmtpConfigurationCause();
 }
 
-if (SMTP_USER && SMTP_PASS) {
-  try {
-    emailTransporter = nodemailer.createTransport(smtpConfig);
-    emailTransporter.on('error', (err) => {
-      console.error('⚠️ SMTP transporter connection error:', err);
-      console.error('⚠️ SMTP transporter connection error:', err);
-    });
-    console.log('✅ Email service configured');
-    console.log(`   SMTP_HOST: ${SMTP_HOST}`);
-    console.log(`   SMTP_PORT: ${SMTP_PORT}`);
-    console.log(`   SMTP_SECURE: ${SMTP_SECURE}`);
-    console.log(`   requireTLS: ${smtpConfig.requireTLS}`);
-    console.log(`   SMTP_SECURE: ${SMTP_SECURE}`);
-    console.log(`   requireTLS: ${smtpConfig.requireTLS}`);
-    console.log(`   SMTP_USER: ${SMTP_USER || '(not set)'}`);
-    console.log(`   SMTP_FROM: ${config.SMTP_FROM}`);
-    console.log(`   SMTP_FROM: ${config.SMTP_FROM}`);
-    console.log(`   hasSMTPPass: ${hasSMTPPass}`);
-    const configCheck = getSmtpConfigurationCause();
-    if (configCheck.cause !== 'ok') {
-      console.warn(`   SMTP configuration warning: ${configCheck.cause} - ${configCheck.message}`);
+if (EMAIL_PROVIDER === 'sendgrid') {
+  if (!SENDGRID_API_KEY) {
+    console.warn('⚠️ SendGrid is selected as the email provider but SENDGRID_API_KEY is not configured.');
+  } else {
+    try {
+      sgMail.setApiKey(SENDGRID_API_KEY);
+      console.log('✅ SendGrid provider configured');
+      console.log(`   EMAIL_PROVIDER: ${EMAIL_PROVIDER}`);
+      console.log(`   SENDGRID_API_KEY: ${SENDGRID_API_KEY ? '<set>' : '<unset>'}`);
+    } catch (err) {
+      console.error('❌ Failed to configure SendGrid provider:', err);
+      emailTransporter = null;
     }
-  } catch (err) {
-    console.error('❌ Failed to create email transporter:', err);
-    console.error('❌ Failed to create email transporter:', err);
-    console.warn('⚠️ Email notifications will be disabled');
-    emailTransporter = null;
   }
 } else {
-  console.warn('⚠️ Email configuration incomplete; email notifications disabled');
-  if (!SMTP_USER) console.warn('   Missing: SMTP_USER');
-  if (!SMTP_PASS) console.warn('   Missing: SMTP_PASS');
-}
-
-function serializeSmtpError(err) {
-  if (!err) return null;
-  const serialized = {
-    message: err.message || String(err),
-    code: err.code || null,
-    command: err.command || null,
-    response: err.response || null,
-    responseCode: err.responseCode || null,
-    stack: err.stack || null
-  };
-
-  for (const key of Object.getOwnPropertyNames(err)) {
-    if (!(key in serialized)) {
-      serialized[key] = err[key];
+  if (SMTP_USER && SMTP_PASS) {
+    try {
+      emailTransporter = nodemailer.createTransport(smtpConfig);
+      emailTransporter.on('error', (err) => {
+        console.error('⚠️ SMTP transporter connection error:', err);
+      });
+      console.log('✅ SMTP email service configured');
+      console.log(`   SMTP_HOST: ${SMTP_HOST}`);
+      console.log(`   SMTP_PORT: ${SMTP_PORT}`);
+      console.log(`   SMTP_SECURE: ${SMTP_SECURE}`);
+      console.log(`   requireTLS: ${smtpConfig.requireTLS}`);
+      console.log(`   SMTP_USER: ${SMTP_USER || '(not set)'}`);
+      console.log(`   SMTP_FROM: ${config.SMTP_FROM}`);
+      console.log(`   hasSMTPPass: ${hasSMTPPass}`);
+      const configCheck = getSmtpConfigurationCause();
+      if (configCheck.cause !== 'ok') {
+        console.warn(`   SMTP configuration warning: ${configCheck.cause} - ${configCheck.message}`);
+      }
+    } catch (err) {
+      console.error('❌ Failed to create SMTP email transporter:', err);
+      console.warn('⚠️ Email notifications will be disabled');
+      emailTransporter = null;
     }
+  } else {
+    console.warn('⚠️ SMTP configuration incomplete or disabled; email notifications disabled for SMTP');
+    if (!SMTP_USER) console.warn('   Missing: SMTP_USER');
+    if (!SMTP_PASS) console.warn('   Missing: SMTP_PASS');
   }
-
-  return serialized;
 }
 
-function logEmailEvent(event, details) {
-  const payload = {
-    event,
-    timestamp: new Date().toISOString(),
-    ...details
-  };
-
-  if (event.endsWith('_failed')) {
-    console.error('[email]', JSON.stringify(payload));
-  } else {
-    console.log('[email]', JSON.stringify(payload));
-  }
+if (isSendGridProvider) {
+  smtpTransporterVerified = true;
 }
 
 async function ensureTransporterVerified() {
-  if (!emailTransporter) {
+  const isSendGrid = EMAIL_PROVIDER === 'sendgrid' && Boolean(SENDGRID_API_KEY);
+  if (!isSendGrid && !emailTransporter) {
     smtpTransporterVerified = false;
     return {
       success: false,
@@ -167,6 +153,11 @@ async function ensureTransporterVerified() {
       diagnosis: configCause.message,
       reason: configCause.message
     };
+  }
+
+  if (isSendGrid) {
+    smtpTransporterVerified = true;
+    return { success: true };
   }
 
   try {
@@ -205,7 +196,10 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
     return false;
   }
 
-  if (!emailTransporter) {
+  const fromAddress = fromEmail || config.SMTP_FROM || NOREPLY_EMAIL;
+  const isSendGrid = EMAIL_PROVIDER === 'sendgrid' && Boolean(SENDGRID_API_KEY);
+
+  if (!isSendGrid && !emailTransporter) {
     logEmailEvent('email_send_failed', {
       reason: 'transporter_not_configured',
       recipient: normalizedTo,
@@ -217,7 +211,7 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
   const configCause = getSmtpConfigurationCause();
   if (configCause.cause !== 'ok') {
     logEmailEvent('email_send_failed', {
-      reason: 'invalid_smtp_configuration',
+      reason: 'invalid_email_configuration',
       recipient: normalizedTo,
       subject,
       cause: configCause.cause,
@@ -226,7 +220,6 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
     return false;
   }
 
-  const fromAddress = fromEmail || config.SMTP_FROM || NOREPLY_EMAIL;
   for (let attempt = 1; attempt <= retries + 1; attempt++) {
     try {
       logEmailEvent('email_send_attempt', {
@@ -234,15 +227,28 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
         subject,
         attempt,
         totalAttempts: retries + 1,
-        from: fromAddress
+        from: fromAddress,
+        provider: EMAIL_PROVIDER
       });
 
-      const sendPromise = emailTransporter.sendMail({
-        from: fromAddress,
-        to: normalizedTo,
-        subject,
-        html
-      });
+      let sendPromise;
+      if (EMAIL_PROVIDER === 'sendgrid' && Boolean(SENDGRID_API_KEY)) {
+        const mailData = {
+          from: fromAddress,
+          to: normalizedTo,
+          subject,
+          html
+        };
+        sendPromise = sgMail.send(mailData);
+      } else {
+        sendPromise = emailTransporter.sendMail({
+          from: fromAddress,
+          to: normalizedTo,
+          subject,
+          html
+        });
+      }
+
       const timeoutPromise = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('SMTP send timeout (>60s)')), 60000)
       );
@@ -252,8 +258,9 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
         recipient: normalizedTo,
         subject,
         attempt,
-        messageId: result?.messageId || null,
-        response: result?.response || null
+        provider: EMAIL_PROVIDER,
+        messageId: result?.[0]?.messageId || result?.messageId || null,
+        response: result?.[0]?.headers || result?.headers || null
       });
       return true;
     } catch (err) {
@@ -357,7 +364,10 @@ async function runSmtpDiagnostics(targetEmail) {
     return diagnostics;
   }
 
-  const transporter = emailTransporter || nodemailer.createTransport(Object.assign({}, smtpConfig, { tls: { rejectUnauthorized: false } }));
+  const isSendGrid = EMAIL_PROVIDER === 'sendgrid' && Boolean(SENDGRID_API_KEY);
+  const transporter = isSendGrid
+    ? null
+    : emailTransporter || nodemailer.createTransport(Object.assign({}, smtpConfig, { tls: { rejectUnauthorized: false } }));
   const testAddress = diagnostics.targetEmail || SMTP_USER || DESIGNER_EMAIL || null;
   if (!testAddress) {
     diagnostics.diagnosis = 'No valid target email address for test send.';
@@ -366,16 +376,23 @@ async function runSmtpDiagnostics(targetEmail) {
   }
 
   try {
-    const verifyPromise = transporter.verify();
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
-    );
+    if (isSendGrid) {
+      diagnostics.connectionSuccess = true;
+      diagnostics.authenticationSuccess = true;
+      diagnostics.diagnosis = 'SendGrid provider configured. No SMTP handshake required.';
+      diagnostics.reason = 'SendGrid API key is configured.';
+    } else {
+      const verifyPromise = transporter.verify();
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('SMTP verification timeout (>60s)')), 60000)
+      );
 
-    await Promise.race([verifyPromise, timeoutPromise]);
-    diagnostics.connectionSuccess = true;
-    diagnostics.authenticationSuccess = true;
-    diagnostics.diagnosis = 'SMTP connection and authentication succeeded.';
-    diagnostics.reason = 'The SMTP server accepted the connection and credentials.';
+      await Promise.race([verifyPromise, timeoutPromise]);
+      diagnostics.connectionSuccess = true;
+      diagnostics.authenticationSuccess = true;
+      diagnostics.diagnosis = 'SMTP connection and authentication succeeded.';
+      diagnostics.reason = 'The SMTP server accepted the connection and credentials.';
+    }
   } catch (err) {
     const classification = classifySmtpError(err);
     diagnostics.connectionSuccess = false;
@@ -395,15 +412,22 @@ async function runSmtpDiagnostics(targetEmail) {
 
   diagnostics.realSendAttempted = true;
   try {
+    const fromAddress = config.SMTP_FROM || SMTP_USER || NOREPLY_EMAIL;
     const mailOptions = {
-      from: config.SMTP_FROM || SMTP_USER || NOREPLY_EMAIL,
+      from: fromAddress,
       to: testAddress,
-      subject: 'Matex SMTP Connectivity Test',
-      text: 'This is a connectivity test message sent by the Matex backend. If you receive this, SMTP is working.',
-      html: `<p>This is a connectivity test message sent by the Matex backend. If you receive this, SMTP is working.</p><p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>`
+      subject: isSendGrid ? 'Matex SendGrid Connectivity Test' : 'Matex SMTP Connectivity Test',
+      text: 'This is a connectivity test message sent by the Matex backend. If you receive this, email is working.',
+      html: `<p>This is a connectivity test message sent by the Matex backend. If you receive this, email is working.</p><p><strong>Timestamp:</strong> ${new Date().toISOString()}</p>`
     };
 
-    const sendPromise = transporter.sendMail(mailOptions);
+    let sendPromise;
+    if (isSendGrid) {
+      sendPromise = sgMail.send(mailOptions);
+    } else {
+      sendPromise = transporter.sendMail(mailOptions);
+    }
+
     const sendTimeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('SMTP send timeout (>60s)')), 60000)
     );
@@ -411,10 +435,12 @@ async function runSmtpDiagnostics(targetEmail) {
     const info = await Promise.race([sendPromise, sendTimeout]);
     diagnostics.realSendSuccess = true;
     diagnostics.emailInfo = {
-      messageId: info?.messageId || null,
-      response: info?.response || null
+      messageId: info?.[0]?.messageId || info?.messageId || null,
+      response: info?.[0]?.headers || info?.headers || null
     };
-    diagnostics.diagnosis = 'SMTP verify and real send succeeded.';
+    diagnostics.diagnosis = isSendGrid
+      ? 'SendGrid connectivity test succeeded.'
+      : 'SMTP verify and real send succeeded.';
     diagnostics.reason = `Test email sent to ${testAddress}.`;
   } catch (err) {
     const classification = classifySmtpError(err);
@@ -1294,7 +1320,7 @@ app.get('/', (req, res) => {
 
 // Health check under the /api prefix for consistency with API routes
 app.get('/health', (req, res) => {
-  const smtpConfigured = Boolean(emailTransporter);
+  const smtpConfigured = isSendGridProvider || Boolean(emailTransporter);
   const smtpConfiguration = getSmtpConfigurationCause();
 
   return res.json({
@@ -1307,12 +1333,13 @@ app.get('/health', (req, res) => {
     smtpConfigured,
     smtpVerified: smtpTransporterVerified,
     smtpConfiguration,
+    emailProvider: EMAIL_PROVIDER,
     adminEventsConnected: adminEventClients.size
   });
 });
 
 app.get('/api/health', (req, res) => {
-  const smtpConfigured = Boolean(emailTransporter);
+  const smtpConfigured = isSendGridProvider || Boolean(emailTransporter);
   const smtpConfiguration = getSmtpConfigurationCause();
 
   return res.json({
@@ -1325,6 +1352,7 @@ app.get('/api/health', (req, res) => {
     smtpConfigured,
     smtpVerified: smtpTransporterVerified,
     smtpConfiguration,
+    emailProvider: EMAIL_PROVIDER,
     adminEventsConnected: adminEventClients.size
   });
 });
@@ -3018,9 +3046,12 @@ app.post('/api/admin/smtp-diagnostic', adminAuth, async (req, res) => {
       return res.status(500).json({ success: false, diagnostics: result });
     }
 
-    if (!emailTransporter) {
+    const emailProviderConfigured = isSendGridProvider || Boolean(emailTransporter);
+    if (!emailProviderConfigured) {
       result.smtpVerification.cause = 'Missing Environment Variable';
-      result.smtpVerification.diagnosis = 'Email transporter is not configured. Check SMTP_USER and SMTP_PASS in your environment.';
+      result.smtpVerification.diagnosis = EMAIL_PROVIDER === 'sendgrid'
+        ? 'SendGrid provider is selected but SENDGRID_API_KEY is not configured.'
+        : 'Email transporter is not configured. Check SMTP_USER and SMTP_PASS in your environment.';
       result.smtpVerification.message = result.smtpVerification.diagnosis;
       return res.status(500).json({ success: false, diagnostics: result });
     }

@@ -937,6 +937,7 @@ const SUPABASE_ORDER_FIELDS = [
   'amount_remaining',
   'payment_method',
   'payment_type',
+  'payment_plan',
   'payment_status',
   'payment_reference',
   'payment_date',
@@ -1244,6 +1245,7 @@ if (config.SUPABASE_URL && config.SUPABASE_KEY) {
 
 // Simple Server-Sent Events (SSE) implementation for admin realtime UI
 const adminEventClients = new Set();
+const conversationEventClients = new Map();
 
 function sendSse(res, event, data) {
   try {
@@ -1265,9 +1267,21 @@ function broadcastAdminEvent(event, payload) {
   }
 }
 
+function broadcastConversationEvent(conversationId, event, payload) {
+  const clients = conversationEventClients.get(conversationId);
+  if (!clients || !clients.size) return;
+  for (const res of Array.from(clients)) {
+    try {
+      sendSse(res, event, payload);
+    } catch (e) {
+      try { res.end(); } catch (er) {}
+      clients.delete(res);
+      if (!clients.size) conversationEventClients.delete(conversationId);
+    }
+  }
+}
+
 // SSE endpoint for admin clients to receive realtime updates
-
-
 app.get('/api/admin/events', (req, res) => {
   // Allow EventSource connections to pass `?token=` since EventSource can't set Authorization header.
   const queryToken = String(req.query?.token || '').trim();
@@ -1861,6 +1875,103 @@ app.get('/api/orders/:orderId/files', async (req, res) => {
 });
 
 /**
+ * POST /api/orders/:orderId/files
+ * Public endpoint for customers to upload files associated with an order
+ * Accepts multipart/form-data with files[]
+ */
+app.post('/api/orders/:orderId/files', upload.array('files'), async (req, res) => {
+  console.log(`📍 POST /api/orders/${req.params.orderId}/files - Public upload`);
+  try {
+    const orderId = String(req.params.orderId || '').trim();
+    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+
+    let files = [];
+    if (Array.isArray(req.files) && req.files.length) {
+      files = req.files.map(file => ({
+        file_name: file.originalname,
+        mime_type: file.mimetype || 'application/octet-stream',
+        buffer: file.buffer,
+        file_size: Number(file.size || 0)
+      }));
+    } else {
+      return res.status(400).json({ success: false, message: 'At least one file is required' });
+    }
+
+    const bucket = 'order-deliveries';
+    const uploadedRecords = [];
+
+    for (const f of files) {
+      const safeName = String(f.file_name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const timestamp = Date.now();
+      const storagePath = `${orderId}/${timestamp}_${safeName}`;
+      const buffer = f.buffer;
+      const mime = f.mime_type || 'application/octet-stream';
+
+      if (!buffer) continue;
+
+      if (supabase) {
+        try {
+          const { data: uploadData, error: uploadError } = await supabase.storage.from(bucket).upload(storagePath, buffer, { contentType: mime, upsert: true });
+          if (uploadError) {
+            console.error('Supabase storage upload error for', storagePath, uploadError);
+          }
+        } catch (err) {
+          console.error('Supabase upload exception for', storagePath, err.message || err);
+        }
+      }
+
+      const record = await persistOrderFile({
+        order_id: orderId,
+        file_name: f.file_name,
+        storage_path: storagePath,
+        bucket_name: bucket,
+        mime_type: mime,
+        file_type: 'revision',
+        file_size: f.file_size || null,
+        uploaded_by: 'customer',
+        uploaded_at: new Date().toISOString()
+      });
+
+      uploadedRecords.push(record);
+    }
+
+    // Append timeline entry to order
+    try {
+      const entry = { status: 'Files Uploaded (customer)', message: `Customer uploaded ${uploadedRecords.length} file(s)`, uploaded_at: new Date().toISOString() };
+      if (supabase) {
+        const existingRes = await supabase.from('matex_orders').select('status_history, client_email').eq('order_id', orderId).limit(1).maybeSingle();
+        const existing = existingRes && !existingRes.error ? existingRes.data || null : null;
+        const existingHistory = Array.isArray(existing?.status_history) ? existing.status_history : [];
+        const newHistory = [...existingHistory, entry];
+        await supabase.from('matex_orders').update({ status_history: newHistory, latest_progress: 'Customer uploaded files' }).eq('order_id', orderId);
+        const clientEmail = existing?.client_email || null;
+        if (clientEmail) {
+          await sendEmail(clientEmail, `Files received for ${orderId}`, buildCustomerNotificationHtml({ order_id: orderId, client_email: clientEmail }, `We received ${uploadedRecords.length} file(s).`));
+        }
+        try { broadcastAdminEvent('order', { order_id: orderId, latest_progress: 'Customer uploaded files', status_history: newHistory }); } catch (e) {}
+      } else {
+        const existing = orderStore.get(orderId) || {};
+        const hist = Array.isArray(existing.status_history) ? existing.status_history : [];
+        existing.status_history = [...hist, entry];
+        existing.latest_progress = 'Customer uploaded files';
+        orderStore.set(orderId, existing);
+        if (existing.client_email) {
+          await sendEmail(existing.client_email, `Files received for ${orderId}`, buildCustomerNotificationHtml({ order_id: orderId, client_email: existing.client_email }, `We received ${uploadedRecords.length} file(s).`));
+        }
+        try { broadcastAdminEvent('order', existing); } catch (e) {}
+      }
+    } catch (notifyErr) {
+      console.error('Order history update / notification failed (public upload):', notifyErr.message || notifyErr);
+    }
+
+    return res.json({ success: true, files: uploadedRecords });
+  } catch (err) {
+    console.error('Public upload files error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to upload files' });
+  }
+});
+
+/**
  * GET /api/orders/:orderId/files/:fileId/download
  * Generate a signed download URL for a specific file if allowed
  */
@@ -1911,6 +2022,30 @@ app.get('/api/admin/orders/:orderId/files/:fileId/download', adminAuth, async (r
     console.error('Admin generate download url error:', err.message || err);
     return res.status(500).json({ success: false, message: 'Unable to generate download URL' });
   }
+});
+
+app.get('/api/chat/conversations/:conversationId/events', async (req, res) => {
+  const conversationId = String(req.params.conversationId || '').trim();
+  if (!conversationId) {
+    res.status(400).send('Conversation id is required');
+    return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders && res.flushHeaders();
+  res.write('retry: 10000\n\n');
+
+  const subscribers = conversationEventClients.get(conversationId) || new Set();
+  subscribers.add(res);
+  conversationEventClients.set(conversationId, subscribers);
+  sendSse(res, 'connected', { conversationId, ts: Date.now() });
+
+  req.on('close', () => {
+    subscribers.delete(res);
+    if (!subscribers.size) conversationEventClients.delete(conversationId);
+  });
 });
 
 app.post('/api/chat/conversations', async (req, res) => {
@@ -1989,6 +2124,7 @@ app.post('/api/chat/conversations', async (req, res) => {
     } catch (e) { console.warn('Failed to append message timeline to conversation', e); }
 
     await notifyAdminAboutNewChatMessage(conversation, message);
+    broadcastConversationEvent(conversation.id, 'chat_message', { conversation, message });
 
     return res.json({ success: true, conversation, message });
   } catch (err) {
@@ -2062,6 +2198,7 @@ app.post('/api/chat/conversations/:conversationId/messages', async (req, res) =>
 
     if (message.sender === 'customer') {
       await notifyAdminAboutNewChatMessage(updatedConversation || conversation, message);
+      broadcastConversationEvent(conversationId, 'chat_message', { conversation: updatedConversation || conversation, message });
       // append to timeline on order if linked
       try {
         if (updatedConversation?.order_id) {
@@ -2153,6 +2290,7 @@ app.post('/api/admin/chat/conversations/:conversationId/messages', adminAuth, as
     });
 
     await notifyCustomerAboutAdminReply(updatedConversation || conversation, message);
+    broadcastConversationEvent(conversationId, 'chat_message', { conversation: updatedConversation || conversation, message });
     // append to order timeline
     try {
       if (updatedConversation?.order_id) {
@@ -2782,7 +2920,6 @@ app.post('/api/orders/brief', async (req, res) => {
   try {
     const payload = req.body || {};
     console.log('🔎 Request payload keys:', Object.keys(payload));
-    console.log('🔎 Full payload:', JSON.stringify(payload, null, 2));
     const order_id = String(payload.order_id || '').trim();
     if (!order_id) {
       return res.status(400).json({ success: false, message: 'order_id is required' });
@@ -2790,6 +2927,18 @@ app.post('/api/orders/brief', async (req, res) => {
 
     const amountValue = typeof payload.amount === 'number' ? payload.amount : (Number(payload.amount) || null);
     const amountPaidValue = typeof payload.amount_paid === 'number' ? payload.amount_paid : 0;
+    const paymentType = payload.payment_type || null;
+    
+    // Extract payment plan ID (full, deposit, preview)
+    let paymentPlanId = payload.payment_plan || payload.selectedPaymentPlan || null;
+    if (!paymentPlanId && paymentType) {
+      // Infer from payment_type if not explicitly provided
+      const typeStr = String(paymentType).toLowerCase();
+      if (typeStr.includes('full')) paymentPlanId = 'full';
+      else if (typeStr.includes('deposit') || typeStr.includes('50%')) paymentPlanId = 'deposit';
+      else if (typeStr.includes('preview') || typeStr.includes('after')) paymentPlanId = 'preview';
+    }
+
     const upsertData = {
       order_id,
       client_name: payload.client_name || payload.full_name || null,
@@ -2797,7 +2946,8 @@ app.post('/api/orders/brief', async (req, res) => {
       whatsapp_number: payload.whatsapp_number || payload.client_phone || payload.phone || null,
       service_name: payload.service_name || payload.service || null,
       payment_method: payload.payment_method || payload.paymentMethod || null,
-      payment_type: payload.payment_type || null,
+      payment_type: paymentType,
+      payment_plan: paymentPlanId,
       payment_status: payload.payment_status || 'Pending',
       amount: amountValue,
       amount_paid: amountPaidValue,
@@ -2809,7 +2959,7 @@ app.post('/api/orders/brief', async (req, res) => {
       // Ensure new briefs still set lifecycle to Pending until admin confirmation
       order_status: payload.order_status || 'Pending',
       latest_progress: payload.latest_progress || 'Brief submitted',
-      revision_count: typeof payload.revision_count === 'number' ? payload.revision_count : getRevisionCount(payload.payment_type || payload.paymentMethod),
+      revision_count: typeof payload.revision_count === 'number' ? payload.revision_count : getRevisionCount(paymentType),
       design_description: payload.design_description || payload.description || null,
       brand_name: payload.brand_name || payload.brand || null,
       brand_color: payload.brand_color || payload.brand_colors || null,
@@ -2820,7 +2970,12 @@ app.post('/api/orders/brief', async (req, res) => {
       created_at: payload.created_at || new Date().toISOString()
     };
 
-    console.log('📦 Upsert data being sent to persistence:', JSON.stringify(upsertData, null, 2));
+    console.log('📦 Upsert data being sent to persistence:');
+    console.log('  Order ID:', order_id);
+    console.log('  Payment Type:', paymentType);
+    console.log('  Payment Plan ID:', paymentPlanId);
+    console.log('  Amount:', amountValue);
+    console.log('  Client Email:', upsertData.client_email);
 
     if (supabase) {
       await persistOrder(upsertData);
@@ -2830,7 +2985,7 @@ app.post('/api/orders/brief', async (req, res) => {
     const merged = Object.assign({}, existing, upsertData);
     orderStore.set(order_id, merged);
     console.log('✅ Brief saved to in-memory store for', order_id);
-    console.log('✅ All brief fields persisted:', Object.keys(merged).filter(k => ['design_description', 'whatsapp_number', 'brand_name', 'brand_color', 'dob', 'deadline', 'reference_link', 'additional_note'].includes(k)));
+    console.log('✅ All brief fields persisted:', Object.keys(merged).filter(k => ['design_description', 'whatsapp_number', 'brand_name', 'brand_color', 'dob', 'deadline', 'reference_link', 'additional_note', 'payment_plan'].includes(k)));
     
     // Create or reuse a chat conversation for this order
     let conversation_id = merged.conversation_id;

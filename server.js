@@ -4,10 +4,12 @@ import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
 import nodemailer from 'nodemailer';
 import sgMail from '@sendgrid/mail';
+import fs from 'fs';
 import multer from 'multer';
 import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import PDFDocument from 'pdfkit';
 import config from './lib/config.js';
 import { createAdminToken, adminAuth, verifyAdminToken } from './lib/auth.js';
 
@@ -233,7 +235,7 @@ function withTimeout(promise, timeoutMs, message) {
 }
 
 // Helper: Send email with retry logic
-async function sendEmail(to, subject, html, fromEmail, retries = 2) {
+async function sendEmail(to, subject, html, fromEmail, retries = 2, attachments = null) {
   const normalizedTo = typeof to === 'string' ? to.trim() : '';
   if (!normalizedTo) {
     logEmailEvent('email_send_skipped', {
@@ -286,14 +288,48 @@ async function sendEmail(to, subject, html, fromEmail, retries = 2) {
           subject,
           html
         };
+        if (Array.isArray(attachments) && attachments.length) {
+          mailData.attachments = [];
+          for (const a of attachments) {
+            try {
+              if (a.path) {
+                const buf = fs.readFileSync(a.path);
+                mailData.attachments.push({
+                  content: buf.toString('base64'),
+                  filename: a.filename || path.basename(a.path),
+                  type: a.contentType || 'application/pdf',
+                  disposition: 'attachment'
+                });
+              } else if (a.content) {
+                const content = Buffer.isBuffer(a.content) ? a.content.toString('base64') : Buffer.from(String(a.content)).toString('base64');
+                mailData.attachments.push({
+                  content,
+                  filename: a.filename || 'attachment',
+                  type: a.contentType || 'application/octet-stream',
+                  disposition: 'attachment'
+                });
+              }
+            } catch (e) {
+              console.warn('Attachment read failed for sendgrid:', e && e.message);
+            }
+          }
+        }
         sendPromise = sgMail.send(mailData);
       } else {
-        sendPromise = emailTransporter.sendMail({
+        const mailOptions = {
           from: fromAddress,
           to: normalizedTo,
           subject,
           html
-        });
+        };
+        if (Array.isArray(attachments) && attachments.length) {
+          mailOptions.attachments = attachments.map(a => {
+            if (a.path) return { filename: a.filename || path.basename(a.path), path: a.path, contentType: a.contentType || 'application/pdf' };
+            if (a.content) return { filename: a.filename || 'attachment', content: a.content, contentType: a.contentType || 'application/octet-stream' };
+            return null;
+          }).filter(Boolean);
+        }
+        sendPromise = emailTransporter.sendMail(mailOptions);
       }
 
       const result = await withTimeout(sendPromise, 60000, 'Email send timeout (>60s)');
@@ -520,6 +556,23 @@ function buildCustomerNotificationHtml(order, customMessage = '') {
         ${customerMessageSection}
       </div>
       <p style="color: #666; font-size: 13px; margin-top: 20px;">Thank you for choosing Matex Creations. We will continue to keep you informed as your project progresses.</p>
+    </div>
+  `;
+}
+
+function buildReceiptEmailHtml(order, receipt) {
+  const name = order.client_name || order.client_email || 'Customer';
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 680px; margin: 0 auto; background: #f5f5f5; padding: 24px; border-radius: 12px;">
+      <h2 style="color: #8b0000; text-align: center;">Payment Receipt</h2>
+      <div style="background: white; padding: 20px; border-radius: 10px; margin-top: 18px;">
+        <p>Hi ${name},</p>
+        <p>Thank you for your payment. Attached is your receipt for Order <strong>${order.order_id || ''}</strong>.</p>
+        <p><strong>Amount Paid:</strong> ₦${(order.amount_paid || 0).toLocaleString()}</p>
+        <p><strong>Reference:</strong> ${order.payment_reference || order.reference || ''}</p>
+        <p><strong>Receipt Number:</strong> ${receipt?.receipt_id || receipt?.id || '—'}</p>
+        <p>If you have any questions, reply to this email or contact support.</p>
+      </div>
     </div>
   `;
 }
@@ -2600,7 +2653,12 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
     const finalOrderId = orderId || storedOrder?.order_id || storedOrder?.id || transaction.reference;
     const paymentTypeRaw = metadata.payment_type || storedOrder?.payment_type || storedOrder?.paymentType || storedOrder?.paymentMethod || 'Unknown';
     const isSuccess = String(transaction.status || '').toLowerCase() === 'success';
-    const amountPaid = Number(transaction.amount || 0) / 100;
+    const transactionAmount = Number(transaction.amount || 0) / 100;
+    // When handling partial payments, accumulate amount_paid across transactions for the same order
+    const previousPaid = typeof storedOrder?.amount_paid === 'number' ? Number(storedOrder.amount_paid) : 0;
+    // Avoid double-counting if this transaction has already been processed for this reference
+    const isAlreadyRecorded = storedOrder && String(storedOrder.payment_reference || '') === String(transaction.reference || '');
+    const amountPaid = isAlreadyRecorded ? previousPaid : previousPaid + transactionAmount;
     const paymentDate = transaction.paid_at || transaction.created_at || new Date().toISOString();
     const paymentStatus = isSuccess ? 'PAID' : (String(transaction.status || '').toLowerCase() === 'failed' ? 'FAILED' : 'Pending');
     const orderStatus = isSuccess ? 'Payment Verified' : (String(transaction.status || '').toLowerCase() === 'failed' ? 'Failed' : 'Pending');
@@ -2608,7 +2666,8 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
     const amountRemaining = typeof storedOrder?.amount === 'number'
       ? Math.max(storedOrder.amount - amountPaid, 0)
       : 0;
-    const downloadAccess = paymentStatus === 'PAID' && String(paymentTypeRaw || '').toLowerCase().includes('full');
+    // Download access: unlock when fully paid OR when original plan is full payment
+    const downloadAccess = (paymentStatus === 'PAID' && (String(paymentTypeRaw || '').toLowerCase().includes('full') || amountRemaining === 0));
 
     const updatedOrder = {
       order_id: finalOrderId,
@@ -2698,6 +2757,31 @@ app.get('/api/payment/verify/:reference', async (req, res) => {
         }
       } catch (err) {
         console.error('❌ Post-payment email notification error:', err.message || err);
+      }
+      // Generate PDF receipt and persist metadata
+      try {
+        const receiptInfo = await generateAndPersistReceipt(updatedOrder, transactionAmount);
+        console.log('✅ Receipt generated:', receiptInfo?.path || receiptInfo?.receipt_id || '<local>');
+        // Attach receipt info to order and persist
+        updatedOrder.receipt = receiptInfo;
+        await persistOrder(updatedOrder);
+        // Attempt to email receipt to customer
+        try {
+          if (customerEmail) {
+            const receiptHtml = buildReceiptEmailHtml(updatedOrder, receiptInfo);
+            const attachments = [{ path: receiptInfo.path, filename: path.basename(receiptInfo.path), contentType: 'application/pdf' }];
+            const emailed = await sendEmail(customerEmail, `Receipt - ${updatedOrder.order_id}`, receiptHtml, null, 2, attachments);
+            if (emailed) {
+              console.log('✅ Receipt emailed to customer:', customerEmail);
+            } else {
+              console.warn('⚠️ Receipt email failed for:', customerEmail);
+            }
+          }
+        } catch (emailErr) {
+          console.error('❌ Receipt email error:', emailErr && (emailErr.message || emailErr));
+        }
+      } catch (rErr) {
+        console.error('❌ Receipt generation failed:', rErr?.message || rErr);
       }
     }
 
@@ -2898,6 +2982,61 @@ app.get('/api/orders/track/:orderId', trackOrderHandler);
 app.get('/api/track-order/:orderId', trackOrderHandler);
 app.get('/track-order/:orderId', trackOrderHandler);
 
+app.get('/api/orders/:orderId/receipt', async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  console.log(`📍 GET /api/orders/${orderId}/receipt - Fetch receipt metadata`);
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: 'orderId is required' });
+  }
+
+  const receipt = await loadReceiptByOrderId(orderId);
+  if (!receipt) {
+    return res.status(404).json({ success: false, message: 'Receipt not found' });
+  }
+
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  return res.json({
+    success: true,
+    receipt: Object.assign({}, receipt, {
+      download_url: receipt.download_url || `${baseUrl}/api/receipts/${encodeURIComponent(receipt.receipt_id)}/download`
+    })
+  });
+});
+
+app.get('/api/orders/:orderId/receipt/download', async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  console.log(`📍 GET /api/orders/${orderId}/receipt/download - Download receipt`);
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: 'orderId is required' });
+  }
+
+  const receipt = await loadReceiptByOrderId(orderId);
+  if (!receipt || !receipt.path) {
+    return res.status(404).json({ success: false, message: 'Receipt not found' });
+  }
+
+  if (!sendReceiptFile(res, receipt)) {
+    return res.status(404).json({ success: false, message: 'Receipt file not found' });
+  }
+});
+
+app.get('/api/receipts/:receiptId/download', async (req, res) => {
+  const receiptId = String(req.params.receiptId || '').trim();
+  console.log(`📍 GET /api/receipts/${receiptId}/download - Download receipt by id`);
+  if (!receiptId) {
+    return res.status(400).json({ success: false, message: 'receiptId is required' });
+  }
+
+  const receipt = await loadReceiptById(receiptId);
+  if (!receipt || !receipt.path) {
+    return res.status(404).json({ success: false, message: 'Receipt not found' });
+  }
+
+  if (!sendReceiptFile(res, receipt)) {
+    return res.status(404).json({ success: false, message: 'Receipt file not found' });
+  }
+});
+
 app.get('/api/orders/:orderId', async (req, res) => {
   const orderId = String(req.params.orderId || '').trim();
   console.log(`📍 GET /api/orders/${orderId} - Fetch order`);
@@ -2910,6 +3049,194 @@ app.get('/api/orders/:orderId', async (req, res) => {
   }
   return res.json({ success: true, order });
 });
+
+/**
+ * Generate a simple PDF receipt and persist metadata.
+ * Stores receipt file under ./receipts and records metadata in Supabase if available.
+ */
+async function generateAndPersistReceipt(order, lastTransactionAmount = 0) {
+  if (!order || !order.order_id) return null;
+  const receiptsDir = path.resolve(__dirname, '..', 'receipts');
+  try {
+    if (!fs.existsSync(receiptsDir)) fs.mkdirSync(receiptsDir, { recursive: true });
+  } catch (e) {
+    console.warn('Unable to ensure receipts dir:', e && e.message);
+  }
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const receiptId = `RCT-${timestamp}-${Math.random().toString(36).slice(2,8)}`;
+  const filename = `${order.order_id || (order.reference || 'unknown')}-${receiptId}.pdf`;
+  const filepath = path.join(receiptsDir, filename);
+
+  try {
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    const stream = fs.createWriteStream(filepath);
+    doc.pipe(stream);
+
+    // Header with logo if available
+    try {
+      const logoPath = path.resolve(__dirname, '..', 'assets', 'logo.png');
+      if (fs.existsSync(logoPath)) {
+        doc.image(logoPath, 40, 40, { width: 120 });
+      }
+    } catch (e) {}
+
+    doc.fontSize(20).text('Matex Creations - Receipt', { align: 'right' });
+    doc.moveDown();
+    doc.fontSize(12);
+    doc.text(`Receipt Number: ${receiptId}`);
+    doc.text(`Order ID: ${order.order_id || ''}`);
+    doc.text(`Customer: ${order.client_name || order.client_email || ''}`);
+    doc.text(`Service: ${order.service_name || ''}`);
+    doc.text(`Payment Plan: ${order.payment_type || order.payment_plan || ''}`);
+    doc.text(`Amount Paid: ₦${(order.amount_paid || 0).toLocaleString()}`);
+    doc.text(`Reference: ${order.payment_reference || order.reference || ''}`);
+    doc.text(`Date: ${new Date(order.paid_at || order.payment_date || Date.now()).toLocaleString()}`);
+    doc.moveDown();
+    doc.text('Thank you for your payment. This receipt confirms the transaction details above.', { width: 450 });
+
+    doc.end();
+
+    await new Promise((resolve, reject) => stream.on('finish', resolve).on('error', reject));
+
+    const receiptRecord = {
+      receipt_id: receiptId,
+      order_id: order.order_id,
+      reference: order.payment_reference || order.reference || null,
+      path: filepath,
+      amount_paid: order.amount_paid || 0,
+      generated_at: new Date().toISOString()
+    };
+
+    // Persist to Supabase if available
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('matex_receipts').insert([receiptRecord]).select();
+        if (!error && Array.isArray(data) && data.length) {
+          return Object.assign({}, receiptRecord, { id: data[0].id });
+        }
+      } catch (e) {
+        console.warn('Supabase persist receipt warning:', e && e.message);
+      }
+    }
+
+    // Fallback: attach to in-memory order and return
+    return receiptRecord;
+  } catch (err) {
+    console.error('Receipt generation error:', err && (err.message || err));
+    throw err;
+  }
+}
+
+/**
+ * Load latest receipt metadata for an order.
+ */
+async function loadReceiptByOrderId(orderId) {
+  const normalized = String(orderId || '').trim();
+  if (!normalized) return null;
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('matex_receipts')
+        .select('*')
+        .eq('order_id', normalized)
+        .order('generated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && data) {
+        return data;
+      }
+    } catch (err) {
+      console.warn('Supabase loadReceiptByOrderId warning:', err?.message || err);
+    }
+  }
+
+  try {
+    const receiptsDir = path.resolve(__dirname, '..', 'receipts');
+    if (!fs.existsSync(receiptsDir)) return null;
+
+    const matches = fs.readdirSync(receiptsDir).filter((file) => file.includes(normalized) && file.endsWith('.pdf'));
+    if (!matches.length) return null;
+
+    matches.sort((a, b) => {
+      const aStat = fs.statSync(path.join(receiptsDir, a));
+      const bStat = fs.statSync(path.join(receiptsDir, b));
+      return bStat.mtimeMs - aStat.mtimeMs;
+    });
+
+    const filename = matches[0];
+    const receiptMatch = filename.match(/(RCT-[^.]+)\.pdf$/);
+    const receiptId = receiptMatch ? receiptMatch[1] : filename.replace(/\.pdf$/i, '');
+
+    return {
+      receipt_id: receiptId,
+      order_id: normalized,
+      filename,
+      path: path.join(receiptsDir, filename),
+      download_url: `/api/receipts/${encodeURIComponent(receiptId)}/download`
+    };
+  } catch (err) {
+    console.warn('Receipt fetch fallback warning:', err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * Load receipt metadata by receipt id.
+ */
+async function loadReceiptById(receiptId) {
+  const normalized = String(receiptId || '').trim();
+  if (!normalized) return null;
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('matex_receipts')
+        .select('*')
+        .eq('receipt_id', normalized)
+        .limit(1)
+        .maybeSingle();
+
+      if (!error && data) {
+        return data;
+      }
+    } catch (err) {
+      console.warn('Supabase loadReceiptById warning:', err?.message || err);
+    }
+  }
+
+  try {
+    const receiptsDir = path.resolve(__dirname, '..', 'receipts');
+    if (!fs.existsSync(receiptsDir)) return null;
+
+    const matches = fs.readdirSync(receiptsDir).filter((file) => file.includes(normalized) && file.endsWith('.pdf'));
+    if (!matches.length) return null;
+
+    const filename = matches[0];
+    return {
+      receipt_id: normalized,
+      filename,
+      path: path.join(receiptsDir, filename)
+    };
+  } catch (err) {
+    console.warn('Receipt fetch fallback warning:', err?.message || err);
+    return null;
+  }
+}
+
+function sendReceiptFile(res, receipt) {
+  if (!receipt || !receipt.path || !fs.existsSync(receipt.path)) return false;
+  res.download(receipt.path, receipt.filename || path.basename(receipt.path), (downloadErr) => {
+    if (downloadErr) {
+      console.error('Receipt download error:', downloadErr && (downloadErr.message || downloadErr));
+      if (!res.headersSent) {
+        res.status(500).send('Unable to download receipt.');
+      }
+    }
+  });
+  return true;
+}
 
 /**
  * POST /api/orders/brief

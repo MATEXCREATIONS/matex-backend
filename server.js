@@ -3003,6 +3003,56 @@ app.get('/api/orders/:orderId/receipt', async (req, res) => {
   });
 });
 
+/**
+ * POST /api/orders/:orderId/receipt/generate
+ * Generate a receipt on-demand for an order if payment and delivery are complete
+ */
+app.post('/api/orders/:orderId/receipt/generate', async (req, res) => {
+  const orderId = String(req.params.orderId || '').trim();
+  console.log(`📍 POST /api/orders/${orderId}/receipt/generate - On-demand receipt generation`);
+  if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+
+  try {
+    const order = await loadOrderById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    // Eligibility: payment completed (amount_paid >= amount or payment_status == 'PAID') and delivery (delivered status present)
+    const paid = (typeof order.amount_paid === 'number' && typeof order.amount === 'number' && order.amount_paid >= (order.amount || 0)) || String(order.payment_status || '').toUpperCase() === 'PAID';
+    const history = Array.isArray(order.status_history) ? order.status_history : [];
+    const delivered = String(order.order_status || '').toLowerCase().includes('delivered') || history.some(h => String(h.status || h.message || '').toLowerCase().includes('delivered'));
+
+    if (!paid || !delivered) {
+      return res.status(400).json({ success: false, message: 'Receipt not available until payment and delivery are complete' });
+    }
+
+    // If a receipt already exists, return it
+    const existingReceipt = await loadReceiptByOrderId(orderId);
+    if (existingReceipt) {
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      return res.json({ success: true, receipt: Object.assign({}, existingReceipt, { download_url: existingReceipt.download_url || `${baseUrl}/api/receipts/${encodeURIComponent(existingReceipt.receipt_id)}/download` }) });
+    }
+
+    // Generate and persist
+    const receipt = await generateAndPersistReceipt(order, order.amount_paid || 0);
+    if (!receipt) return res.status(500).json({ success: false, message: 'Unable to generate receipt' });
+
+    // Persist receipt metadata to Supabase order row if available
+    try {
+      if (supabase) {
+        await supabase.from('matex_receipts').insert([receipt]);
+      }
+    } catch (e) {
+      console.warn('Failed to persist receipt metadata to Supabase:', e && e.message);
+    }
+
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    return res.json({ success: true, receipt: Object.assign({}, receipt, { download_url: `${baseUrl}/api/receipts/${encodeURIComponent(receipt.receipt_id)}/download` }) });
+  } catch (err) {
+    console.error('On-demand receipt generation error:', err && (err.message || err));
+    return res.status(500).json({ success: false, message: 'Unable to generate receipt' });
+  }
+});
+
 app.get('/api/orders/:orderId/receipt/download', async (req, res) => {
   const orderId = String(req.params.orderId || '').trim();
   console.log(`📍 GET /api/orders/${orderId}/receipt/download - Download receipt`);
@@ -3068,34 +3118,93 @@ async function generateAndPersistReceipt(order, lastTransactionAmount = 0) {
   const filepath = path.join(receiptsDir, filename);
 
   try {
+    const formatReceiptDate = (value) => {
+      if (!value) return '—';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+    };
+    const formatMoney = (value) => `₦${Number(value || 0).toLocaleString('en-NG')}`;
+    const history = Array.isArray(order.status_history) ? order.status_history : [];
+    const deliveryEvent = history.find((entry) => /delivered|completed/i.test(String(entry.status || entry.message || '')));
+    const deliveryTimestamp = deliveryEvent ? (deliveryEvent.updated_at || deliveryEvent.created_at || deliveryEvent.created || null) : null;
+    const deliveryConfirmation = deliveryEvent ? `${String(deliveryEvent.status || deliveryEvent.message || 'Delivered').trim()} • ${formatReceiptDate(deliveryTimestamp)}` : order.download_access ? 'Delivery confirmed' : 'Delivery pending';
+    const paymentMethod = order.payment_method || order.payment_type || 'Paystack';
+    const paymentReference = order.payment_reference || order.reference || 'N/A';
+    const paidAt = order.paid_at || order.payment_date || order.created_at || order.created || null;
+    const revisionsAllowed = typeof order.revisions_allowed === 'number' ? order.revisions_allowed : (typeof order.revision_count === 'number' ? order.revision_count : 0);
+    const companyName = config.COMPANY_NAME || 'Matex Creations';
+    const companyAddress = config.COMPANY_ADDRESS || 'Ikeja, Lagos, Nigeria';
+    const companyEmail = config.COMPANY_EMAIL || config.NOREPLY_EMAIL || 'info@matexcreations.com';
+    const companyPhone = config.COMPANY_PHONE || '+234 000 000 0000';
+    const companyWebsite = config.COMPANY_WEBSITE || 'www.matexcreations.com';
+
     const doc = new PDFDocument({ size: 'A4', margin: 40 });
     const stream = fs.createWriteStream(filepath);
     doc.pipe(stream);
 
-    // Header with logo if available
+    doc.fillColor('#000000');
     try {
       const logoPath = path.resolve(__dirname, '..', 'assets', 'logo.png');
       if (fs.existsSync(logoPath)) {
-        doc.image(logoPath, 40, 40, { width: 120 });
+        doc.image(logoPath, 40, 40, { width: 110 });
       }
-    } catch (e) {}
+    } catch (e) {
+      // ignore missing logo
+    }
 
-    doc.fontSize(20).text('Matex Creations - Receipt', { align: 'right' });
-    doc.moveDown();
-    doc.fontSize(12);
-    doc.text(`Receipt Number: ${receiptId}`);
-    doc.text(`Order ID: ${order.order_id || ''}`);
-    doc.text(`Customer: ${order.client_name || order.client_email || ''}`);
-    doc.text(`Service: ${order.service_name || ''}`);
-    doc.text(`Payment Plan: ${order.payment_type || order.payment_plan || ''}`);
-    doc.text(`Amount Paid: ₦${(order.amount_paid || 0).toLocaleString()}`);
-    doc.text(`Reference: ${order.payment_reference || order.reference || ''}`);
-    doc.text(`Date: ${new Date(order.paid_at || order.payment_date || Date.now()).toLocaleString()}`);
-    doc.moveDown();
-    doc.text('Thank you for your payment. This receipt confirms the transaction details above.', { width: 450 });
+    doc.fontSize(22).font('Helvetica-Bold').text(companyName, 320, 40, { align: 'right' });
+    doc.fontSize(10).font('Helvetica').text(companyAddress, { align: 'right' });
+    doc.text(`Email: ${companyEmail}`, { align: 'right' });
+    doc.text(`Phone: ${companyPhone}`, { align: 'right' });
+    doc.text(`Website: ${companyWebsite}`, { align: 'right' });
+
+    doc.moveDown(2);
+    doc.fillColor('#222222').fontSize(16).font('Helvetica-Bold').text('Professional Receipt', { underline: true });
+    doc.moveDown(0.5);
+
+    const left = 40;
+    const right = 320;
+    const labelOptions = { width: 120, continued: true };
+
+    doc.fontSize(11).font('Helvetica-Bold').text('Receipt No:', left, doc.y);
+    doc.font('Helvetica').text(receiptId, { align: 'left' });
+    doc.moveDown(0.3);
+    doc.font('Helvetica-Bold').text('Order ID:', left, doc.y);
+    doc.font('Helvetica').text(order.order_id || '—');
+    doc.moveDown(0.3);
+    doc.font('Helvetica-Bold').text('Order Date:', left, doc.y);
+    doc.font('Helvetica').text(formatReceiptDate(order.created_at || order.created || paidAt));
+    doc.moveDown(0.3);
+    doc.font('Helvetica-Bold').text('Payment Date:', left, doc.y);
+    doc.font('Helvetica').text(formatReceiptDate(paidAt));
+    doc.moveDown(1);
+
+    doc.fontSize(12).font('Helvetica-Bold').text('Customer Information');
+    doc.moveDown(0.3);
+    doc.fontSize(11).font('Helvetica').text(`Name: ${order.client_name || order.client_email || 'Customer'}`);
+    doc.text(`Email: ${order.client_email || order.email || 'N/A'}`);
+    doc.text(`Phone: ${order.whatsapp_number || order.client_phone || 'N/A'}`);
+    doc.moveDown(0.8);
+
+    doc.fontSize(12).font('Helvetica-Bold').text('Order Summary');
+    doc.moveDown(0.3);
+    doc.fontSize(11).font('Helvetica').text(`Service: ${order.service_name || order.service || '—'}`);
+    doc.text(`Amount Paid: ${formatMoney(order.amount_paid || order.amount || lastTransactionAmount || 0)}`);
+    doc.text(`Payment Method: ${paymentMethod}`);
+    doc.text(`Payment Reference: ${paymentReference}`);
+    doc.text(`Delivery Confirmation: ${deliveryConfirmation}`);
+    doc.text(`Revision Allowance: ${revisionsAllowed} revision${revisionsAllowed === 1 ? '' : 's'}`);
+    doc.moveDown(0.8);
+
+    doc.rect(left, doc.y, 515, 0.5).fill('#E5E7EB').stroke();
+    doc.moveDown(1);
+
+    doc.fontSize(11).font('Helvetica').fillColor('#444444').text('Thank you for choosing Matex Creations. We appreciate your business and look forward to delivering exceptional work for your brand. Please keep this receipt for your records.', { width: 515, align: 'left', lineGap: 4 });
+    doc.moveDown(1.5);
+    doc.fontSize(10).font('Helvetica-Oblique').fillColor('#666666').text('This receipt was generated automatically and is valid for accounting and verification purposes.', { width: 515, align: 'left' });
 
     doc.end();
-
     await new Promise((resolve, reject) => stream.on('finish', resolve).on('error', reject));
 
     const receiptRecord = {

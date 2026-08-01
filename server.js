@@ -646,6 +646,7 @@ const chatMessagesStore = new Map();
 
 // In-memory fallback store for order files when Supabase is not configured
 const orderFilesStore = new Map();
+const aiReportStore = new Map();
 
 function normalizeOrderFile(record) {
   const now = new Date().toISOString();
@@ -853,6 +854,120 @@ async function persistEmailReply(reply) {
     try { broadcastAdminEvent('email_reply', record); } catch (e) {}
     return record;
   }
+}
+
+function normalizeAiReport(report) {
+  if (!report) return null;
+  const now = new Date().toISOString();
+  return {
+    id: String(report.id || crypto.randomUUID()),
+    reference_number: String(report.reference_number || `AIREP-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`),
+    customer_name: report.customer_name ? String(report.customer_name).trim() : null,
+    customer_email: report.customer_email ? String(report.customer_email).trim() : null,
+    issue_summary: String(report.issue_summary || '').trim(),
+    suggested_action: String(report.suggested_action || '').trim(),
+    priority: String(report.priority || 'normal'),
+    status: String(report.status || 'unread'),
+    created_at: report.created_at || now,
+    updated_at: report.updated_at || now
+  };
+}
+
+async function persistAiReport(report) {
+  if (!report || !String(report.issue_summary || '').trim()) return null;
+  const record = normalizeAiReport(report);
+  if (!supabase) {
+    aiReportStore.set(record.id, record);
+    try { broadcastAdminEvent('ai_report', record); } catch (e) {}
+    return record;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_ai_reports').insert([record]).select();
+    if (error) {
+      console.error('Supabase persistAiReport error:', error);
+      throw error;
+    }
+    const persisted = Array.isArray(data) && data.length > 0 ? data[0] : record;
+    try { broadcastAdminEvent('ai_report', persisted); } catch (e) {}
+    return persisted;
+  } catch (err) {
+    console.error('persistAiReport exception:', err.message || err);
+    try { broadcastAdminEvent('ai_report', record); } catch (e) {}
+    return record;
+  }
+}
+
+async function updateAiReport(reportId, patch) {
+  if (!reportId || !patch) return null;
+  const existing = await loadAiReports().then((reports) => (reports || []).find((item) => String(item.id) === String(reportId)));
+  if (!existing) return null;
+  const updated = Object.assign({}, existing, patch, { updated_at: new Date().toISOString() });
+  if (!supabase) {
+    aiReportStore.set(updated.id, updated);
+    try { broadcastAdminEvent('ai_report', updated); } catch (e) {}
+    return updated;
+  }
+  try {
+    const { data, error } = await supabase.from('matex_ai_reports').update(patch).eq('id', reportId).select().limit(1).maybeSingle();
+    if (error) {
+      console.error('Supabase updateAiReport error:', error);
+      return null;
+    }
+    return data || updated;
+  } catch (err) {
+    console.error('updateAiReport exception:', err.message || err);
+    return null;
+  }
+}
+
+async function loadAiReports() {
+  if (!supabase) {
+    return Array.from(aiReportStore.values()).sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  }
+  try {
+    const { data, error } = await supabase.from('matex_ai_reports').select('*').order('created_at', { ascending: false });
+    if (error) {
+      console.error('Supabase loadAiReports error:', error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error('loadAiReports exception:', err.message || err);
+    return [];
+  }
+}
+
+async function notifyAdminAboutAiReport(report) {
+  if (!DESIGNER_EMAIL || !report) return;
+  try {
+    await sendEmail(
+      DESIGNER_EMAIL,
+      `AI escalation report: ${report.reference_number}`,
+      buildAiReportNotificationHtml(report)
+    );
+  } catch (err) {
+    console.error('Admin AI report notification failed:', err.message || err);
+  }
+}
+
+function buildAiReportNotificationHtml(report) {
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 680px; margin: 0 auto; background: #f5f5f5; padding: 24px; border-radius: 12px;">
+      <h2 style="color: #8b0000; text-align: center;">AI Escalation Report</h2>
+      <div style="background: white; padding: 20px; border-radius: 10px; margin-top: 18px;">
+        <p><strong>Reference:</strong> ${report.reference_number}</p>
+        <p><strong>Customer:</strong> ${report.customer_name || 'Unknown'}</p>
+        <p><strong>Email:</strong> ${report.customer_email || 'N/A'}</p>
+        <p><strong>Priority:</strong> ${report.priority || 'normal'}</p>
+        <hr style="margin: 16px 0; border-color: #eee;" />
+        <p><strong>Issue Summary:</strong></p>
+        <p style="white-space: pre-wrap;">${report.issue_summary}</p>
+        <p><strong>Suggested Action:</strong></p>
+        <p style="white-space: pre-wrap;">${report.suggested_action}</p>
+      </div>
+      <p style="color: #666; font-size: 13px; margin-top: 20px;">This report was generated automatically by the Matex assistant escalation workflow.</p>
+    </div>
+  `;
 }
 
 async function loadChatConversations() {
@@ -1106,7 +1221,8 @@ async function ensureSupabaseSchemaCompatibility() {
     { table: 'matex_chat_conversations', columns: ['order_id', 'unread_admin_count', 'unread_customer_count'] },
     { table: 'matex_chat_messages', columns: ['conversation_id', 'is_system'] },
     { table: 'matex_order_files', columns: ['delivery_status', 'notify_sent'] },
-    { table: 'matex_revisions', columns: ['revisions_used', 'revisions_remaining'] }
+    { table: 'matex_revisions', columns: ['revisions_used', 'revisions_remaining'] },
+    { table: 'matex_ai_reports', columns: ['reference_number', 'issue_summary', 'suggested_action', 'status'] }
   ];
 
   for (const check of tableChecks) {
@@ -2550,16 +2666,61 @@ app.post('/api/admin/chat/conversations/:conversationId/read', adminAuth, async 
   }
 });
 
+app.get('/api/admin/ai/reports', adminAuth, async (req, res) => {
+  console.log('📍 GET /api/admin/ai/reports - Listing AI escalation reports');
+  try {
+    const reports = await loadAiReports();
+    return res.json({ success: true, reports });
+  } catch (err) {
+    console.error('Admin load AI reports error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to load AI reports.' });
+  }
+});
+
+app.put('/api/admin/ai/reports/:reportId/status', adminAuth, async (req, res) => {
+  console.log(`📍 PUT /api/admin/ai/reports/${req.params.reportId}/status - Update report status`);
+  try {
+    const reportId = String(req.params.reportId || '').trim();
+    const { status } = req.body || {};
+    if (!reportId || !status || !['unread', 'read', 'resolved'].includes(String(status))) {
+      return res.status(400).json({ success: false, message: 'Valid status is required.' });
+    }
+    const updatedReport = await updateAiReport(reportId, { status: String(status) });
+    if (!updatedReport) {
+      return res.status(404).json({ success: false, message: 'AI report not found.' });
+    }
+    return res.json({ success: true, report: updatedReport });
+  } catch (err) {
+    console.error('Update AI report status error:', err.message || err);
+    return res.status(500).json({ success: false, message: 'Unable to update AI report status.' });
+  }
+});
+
 app.post('/api/assistant/query', async (req, res) => {
   console.log('📍 POST /api/assistant/query - Assistant query received');
   try {
-    const { query } = req.body || {};
+    const { query, customer_name, customer_email } = req.body || {};
     if (!query || !String(query).trim()) {
       return res.status(400).json({ success: false, message: 'Query text is required.' });
     }
 
     const response = buildAssistantResponse(query);
-    return res.json({ success: true, assistant: response });
+    let aiReport = null;
+    if (String(response.template || '').toLowerCase() === 'escalation') {
+      aiReport = await persistAiReport({
+        customer_name: String(customer_name || '').trim() || null,
+        customer_email: String(customer_email || '').trim() || null,
+        issue_summary: String(query).trim(),
+        suggested_action: response.text,
+        priority: 'high',
+        status: 'unread'
+      });
+      if (aiReport) {
+        await notifyAdminAboutAiReport(aiReport);
+      }
+    }
+
+    return res.json({ success: true, assistant: response, ai_report: aiReport });
   } catch (err) {
     console.error('Assistant query error:', err.message || err);
     return res.status(500).json({ success: false, message: 'Unable to process query.' });

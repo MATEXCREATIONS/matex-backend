@@ -13,6 +13,7 @@ import PDFDocument from 'pdfkit';
 import config from './lib/config.js';
 import { createAdminToken, adminAuth, verifyAdminToken } from './lib/auth.js';
 import { buildAssistantResponse } from './lib/assistant.js';
+import { computeRevisionState } from './lib/revision_workflow.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1104,6 +1105,8 @@ const SUPABASE_ORDER_FIELDS = [
   'amount',
   'amount_paid',
   'amount_remaining',
+  'amount_due',
+  'remaining_balance',
   'payment_method',
   'payment_type',
   'payment_plan',
@@ -1112,6 +1115,8 @@ const SUPABASE_ORDER_FIELDS = [
   'payment_date',
   'paid_at',
   'download_access',
+  'downloads_locked',
+  'preview_ready',
   'order_status',
   'revision_count',
   'revisions_allowed',
@@ -1137,6 +1142,18 @@ function getRevisionCount(paymentType) {
   return 1;
 }
 
+function normalizePaymentPlan(value, paymentTypeValue = null) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'pay_after_preview' || normalized === 'preview' || normalized === 'pay-after-preview') return 'pay_after_preview';
+  if (normalized === 'deposit' || normalized === '50% deposit' || normalized === '50%') return 'deposit';
+  if (normalized === 'full' || normalized === 'full payment' || normalized === 'full-payment') return 'full';
+  const typeValue = String(paymentTypeValue || '').toLowerCase();
+  if (typeValue.includes('preview') || typeValue.includes('after')) return 'pay_after_preview';
+  if (typeValue.includes('deposit') || typeValue.includes('50%')) return 'deposit';
+  if (typeValue.includes('full')) return 'full';
+  return 'full';
+}
+
 function computeRevisionState(order = {}) {
   const paymentType = String(order.payment_type || order.paymentType || order.paymentMethod || '').toLowerCase();
   const allowed = Number.isFinite(Number(order.revisions_allowed))
@@ -1153,9 +1170,21 @@ function normalizeOrderRecord(order) {
   if (!order || !order.order_id) return null;
   const amount = typeof order.amount === 'number' ? order.amount : (Number(order.amount) || null);
   const amountPaid = typeof order.amount_paid === 'number' ? order.amount_paid : (Number(order.amount_paid) || 0);
-  const paymentStatusNormalized = String(order.payment_status || order.paymentStatus || 'Pending').toUpperCase();
+  const paymentStatusRaw = String(order.payment_status || order.paymentStatus || 'Pending').trim();
+  const paymentStatusNormalized = paymentStatusRaw.toUpperCase();
   const paymentTypeValue = order.payment_type || order.paymentType || order.paymentMethod || null;
+  const paymentPlanValue = normalizePaymentPlan(order.payment_plan || order.paymentPlan || order.selectedPaymentPlan || null, paymentTypeValue);
   const isFullPayment = String(paymentTypeValue || '').toLowerCase().includes('full');
+  const amountDue = typeof order.amount_due === 'number' ? order.amount_due : (typeof order.amount === 'number' ? order.amount : amount);
+  const remainingBalance = typeof order.remaining_balance === 'number'
+    ? order.remaining_balance
+    : (typeof order.amount_remaining === 'number' ? order.amount_remaining : (amount !== null ? Math.max(amount - amountPaid, 0) : null));
+  const downloadsLocked = typeof order.downloads_locked === 'boolean'
+    ? order.downloads_locked
+    : (paymentStatusNormalized === 'PAID' ? false : (paymentPlanValue === 'pay_after_preview' || !isFullPayment));
+  const previewReady = typeof order.preview_ready === 'boolean'
+    ? order.preview_ready
+    : (paymentStatusNormalized === 'PAID' ? true : false);
 
   const record = {
     order_id: String(order.order_id),
@@ -1167,13 +1196,18 @@ function normalizeOrderRecord(order) {
     amount,
     amount_paid: amountPaid || 0,
     amount_remaining: amount !== null ? Math.max(amount - amountPaid, 0) : (typeof order.amount_remaining === 'number' ? order.amount_remaining : null),
+    amount_due: amountDue,
+    remaining_balance: remainingBalance,
     payment_method: order.payment_method || order.paymentMethod || null,
     payment_type: paymentTypeValue,
-    payment_status: paymentStatusNormalized === 'FAILED' ? 'FAILED' : (paymentStatusNormalized === 'PAID' ? 'PAID' : 'Pending'),
+    payment_plan: paymentPlanValue,
+    payment_status: paymentStatusNormalized === 'FAILED' ? 'FAILED' : (paymentStatusNormalized === 'PAID' ? 'PAID' : (paymentStatusRaw || 'Pending')),
     payment_reference: order.payment_reference || order.reference || null,
     payment_date: order.payment_date || order.paid_at || null,
     paid_at: order.paid_at || order.payment_date || null,
     download_access: paymentStatusNormalized === 'PAID' && isFullPayment,
+    downloads_locked: downloadsLocked,
+    preview_ready: previewReady,
     order_status: order.order_status || order.status || 'Pending',
     revision_count: typeof order.revision_count === 'number' ? order.revision_count : getRevisionCount(paymentTypeValue),
     latest_progress: order.latest_progress || order.status || 'Order created',
@@ -2751,7 +2785,7 @@ app.post('/api/payment/initialize', async (req, res) => {
   }
 
   try {
-    const { order_id, email, amount, amount_kobo, service_name, payment_type, callback_url } = req.body;
+    const { order_id, email, amount, amount_kobo, service_name, payment_type, callback_url, payment_plan } = req.body;
 
     // Validation: accept either `amount` (Naira) or `amount_kobo` (integer)
     if (!order_id || !email || (!(amount || amount_kobo)) || !service_name || !payment_type) {
@@ -2782,6 +2816,9 @@ app.post('/api/payment/initialize', async (req, res) => {
       });
     }
 
+    const normalizedPaymentType = String(payment_type || '').trim() || (String(payment_plan || '').toLowerCase() === 'deposit' ? '50% Deposit' : (String(payment_plan || '').toLowerCase() === 'preview' ? 'Pay After Preview' : 'Full Payment'));
+    const normalizedPaymentPlan = String(payment_plan || '').trim() || (String(normalizedPaymentType).toLowerCase().includes('deposit') ? 'deposit' : (String(normalizedPaymentType).toLowerCase().includes('preview') ? 'preview' : 'full'));
+
     // Initialize Paystack transaction
     const initializePayload = {
       email,
@@ -2789,7 +2826,8 @@ app.post('/api/payment/initialize', async (req, res) => {
       metadata: {
         order_id: String(order_id),
         service_name: String(service_name),
-        payment_type: String(payment_type)
+        payment_type: String(normalizedPaymentType),
+        payment_plan: String(normalizedPaymentPlan)
       }
     };
     if (callback_url) {
@@ -2828,7 +2866,8 @@ app.post('/api/payment/initialize', async (req, res) => {
         amount: amountInKobo / 100,
         service_name,
         payment_method: 'Paystack',
-        payment_type,
+        payment_type: normalizedPaymentType,
+        payment_plan: normalizedPaymentPlan,
         amount_paid: 0,
         amount_remaining: amountInKobo / 100,
         payment_reference: payload.reference,
@@ -3644,15 +3683,15 @@ app.post('/api/orders/brief', async (req, res) => {
     const amountPaidValue = typeof payload.amount_paid === 'number' ? payload.amount_paid : 0;
     const paymentType = payload.payment_type || null;
     
-    // Extract payment plan ID (full, deposit, preview)
     let paymentPlanId = payload.payment_plan || payload.selectedPaymentPlan || null;
     if (!paymentPlanId && paymentType) {
-      // Infer from payment_type if not explicitly provided
       const typeStr = String(paymentType).toLowerCase();
       if (typeStr.includes('full')) paymentPlanId = 'full';
       else if (typeStr.includes('deposit') || typeStr.includes('50%')) paymentPlanId = 'deposit';
       else if (typeStr.includes('preview') || typeStr.includes('after')) paymentPlanId = 'preview';
     }
+    const normalizedPaymentPlan = normalizePaymentPlan(paymentPlanId, paymentType);
+    const isPreviewPlan = normalizedPaymentPlan === 'pay_after_preview';
 
     const upsertData = {
       order_id,
@@ -3662,18 +3701,22 @@ app.post('/api/orders/brief', async (req, res) => {
       service_name: payload.service_name || payload.service || null,
       payment_method: payload.payment_method || payload.paymentMethod || null,
       payment_type: paymentType,
-      payment_plan: paymentPlanId,
-      payment_status: payload.payment_status || 'Pending',
+      payment_plan: normalizedPaymentPlan,
+      payment_status: isPreviewPlan ? 'pending' : (payload.payment_status || 'Pending'),
       amount: amountValue,
       amount_paid: amountPaidValue,
       amount_remaining: amountValue !== null ? Math.max(amountValue - amountPaidValue, 0) : null,
+      amount_due: typeof payload.amount_due === 'number' ? payload.amount_due : amountValue,
+      remaining_balance: typeof payload.remaining_balance === 'number' ? payload.remaining_balance : (amountValue !== null ? Math.max(amountValue - amountPaidValue, 0) : null),
       payment_reference: payload.payment_reference || null,
       payment_date: payload.payment_date || payload.paid_at || null,
       paid_at: payload.paid_at || payload.payment_date || null,
       download_access: false,
+      downloads_locked: isPreviewPlan,
+      preview_ready: !isPreviewPlan,
       // Ensure new briefs still set lifecycle to Pending until admin confirmation
-      order_status: payload.order_status || 'Pending',
-      latest_progress: payload.latest_progress || 'Brief submitted',
+      order_status: isPreviewPlan ? 'pending' : (payload.order_status || 'Pending'),
+      latest_progress: isPreviewPlan ? 'Order submitted for preview review' : (payload.latest_progress || 'Brief submitted'),
       revision_count: typeof payload.revision_count === 'number' ? payload.revision_count : getRevisionCount(paymentType),
       design_description: payload.design_description || payload.description || null,
       brand_name: payload.brand_name || payload.brand || null,
@@ -4404,11 +4447,17 @@ app.get('/api/routes', (req, res) => {
  * POST /api/revisions/request
  * Submit a revision request for an order
  */
-app.post('/api/revisions/request', async (req, res) => {
-  const { order_id, customer_message } = req.body;
+app.post('/api/revisions/request', upload.fields([{ name: 'screenshot', maxCount: 1 }, { name: 'attachment', maxCount: 1 }]), async (req, res) => {
+  const body = req.body || {};
+  const order_id = String(body.order_id || body.orderId || '').trim();
+  const customer_message = String(body.customer_message || body.customerMessage || body.notes || body.title || '').trim();
+  const title = String(body.title || body.revision_title || body.revisionTitle || '').trim();
+  const notes = String(body.notes || body.revision_notes || body.revisionNotes || '').trim();
+  const priority = String(body.priority || 'normal').trim();
   console.log(`📍 POST /api/revisions/request - Order ${order_id}`);
 
-  if (!order_id || !customer_message || !String(customer_message).trim()) {
+  const messageText = customer_message || `${title}${title && notes ? ': ' : ''}${notes}`.trim();
+  if (!order_id || !messageText) {
     return res.status(400).json({ success: false, message: 'order_id and customer_message are required' });
   }
 
@@ -4435,7 +4484,10 @@ app.post('/api/revisions/request', async (req, res) => {
     const nextRemaining = Math.max(revisionsAllowed - nextUsed, 0);
     const revisionRecord = {
       order_id,
-      customer_message: String(customer_message).trim(),
+      title: title || 'Revision request',
+      notes: notes || messageText,
+      customer_message: messageText,
+      priority,
       admin_reply: null,
       status: 'Pending',
       revisions_used: nextUsed,
@@ -4447,7 +4499,46 @@ app.post('/api/revisions/request', async (req, res) => {
       completed_at: null
     };
 
-    const timelineEntry = { event: 'Revision Requested', message: String(customer_message).trim(), updated_at: new Date().toISOString() };
+    const timelineEntry = { event: 'Revision Requested', message: messageText, updated_at: new Date().toISOString() };
+    const uploadedFiles = [];
+    const attachedFiles = [];
+    const fileInputs = [
+      ...(Array.isArray(req.files?.screenshot) ? req.files.screenshot : []),
+      ...(Array.isArray(req.files?.attachment) ? req.files.attachment : [])
+    ];
+
+    for (const file of fileInputs) {
+      if (!file || !file.buffer) continue;
+      const safeName = String(file.originalname || 'revision-attachment').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const storagePath = `${order_id}/${Date.now()}_${safeName}`;
+      const bucket = 'order-deliveries';
+      const mime = file.mimetype || 'application/octet-stream';
+      if (supabase) {
+        try {
+          await supabase.storage.from(bucket).upload(storagePath, file.buffer, { contentType: mime, upsert: true });
+        } catch (err) {
+          console.warn('Revision attachment storage upload failed', err?.message || err);
+        }
+      }
+      const record = await persistOrderFile({
+        order_id,
+        file_name: safeName,
+        storage_path: storagePath,
+        bucket_name: bucket,
+        mime_type: mime,
+        file_type: 'revision',
+        version_label: file.fieldname === 'attachment' ? 'Attachment' : 'Revision Preview',
+        uploaded_by: 'customer',
+        uploaded_at: new Date().toISOString()
+      });
+      uploadedFiles.push(record);
+      attachedFiles.push(record.id);
+    }
+
+    if (uploadedFiles.length) {
+      revisionRecord.revision_files = uploadedFiles;
+    }
+
     if (supabase) {
       const { data, error } = await supabase.from('matex_revisions').insert([revisionRecord]).select();
       if (error) {
@@ -4488,7 +4579,7 @@ app.post('/api/revisions/request', async (req, res) => {
         sender: 'system',
         sender_name: 'System',
         sender_email: null,
-        body: `Revision requested: ${String(customer_message).trim()}`,
+        body: `Revision requested: ${messageText}`,
         is_system: true
       }).catch(() => null);
       await updateChatConversation(conversation.id, { unread_admin_count: Number(conversation.unread_admin_count || 0) + 1, last_message_at: new Date().toISOString(), updated_at: new Date().toISOString() }).catch(() => null);
@@ -4499,14 +4590,9 @@ app.post('/api/revisions/request', async (req, res) => {
     } catch (err) {
       console.warn('Failed to send revision notification email:', err?.message || err);
     }
-    try {
-      await sendEmail(DESIGNER_EMAIL, `Revision requested for ${order_id}`, buildCustomerNotificationHtml({ order_id, client_name: order.client_name || 'Customer', client_email: order.client_email || '', latest_progress: 'Revision requested by customer' }, `A revision was requested for ${order_id}.`));
-    } catch (err) {
-      console.warn('Failed to send revision notification email:', err?.message || err);
-    }
 
     console.log('✅ Revision request created:', revisionRecord.id);
-    res.json({ success: true, message: 'Revision request submitted', revision: revisionRecord });
+    res.json({ success: true, message: 'Revision request submitted', revision: revisionRecord, files: uploadedFiles });
   } catch (err) {
     console.error('❌ Revision request error:', err && (err.message || err));
     res.status(500).json({ success: false, message: 'Failed to process revision request' });
@@ -4638,13 +4724,15 @@ app.put('/api/revisions/:revisionId/approve', adminAuth, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Revision not found' });
     }
 
+    const order = await loadOrderById(revision.order_id);
+    const state = computeRevisionState(order || revision || {});
     const updatedRevision = {
       ...revision,
       status: 'Approved',
       approved_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-      revisions_used: (revision.revisions_used || 0) + 1,
-      revisions_remaining: Math.max(0, (revision.revisions_remaining || 1) - 1)
+      revisions_used: Math.max(Number(revision.revisions_used || state.used || 0), Number(revision.revisions_used || 0) + 1),
+      revisions_remaining: Math.max(0, Number(state.remaining || revision.revisions_remaining || 0) - 1)
     };
 
     if (supabase) {
@@ -4665,6 +4753,7 @@ app.put('/api/revisions/:revisionId/approve', adminAuth, async (req, res) => {
         order_id: revision.order_id,
         revisions_used: updatedRevision.revisions_used,
         revisions_remaining: updatedRevision.revisions_remaining,
+        revision_count: Number(existingOrder?.revisions_allowed || existingOrder?.revision_count || state.allowed || 0),
         latest_progress: 'Revision approved by admin',
         status_history: [...history, timelineEntry]
       }).catch((persistErr) => {

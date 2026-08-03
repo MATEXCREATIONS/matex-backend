@@ -1,5 +1,5 @@
--- Production-safe schema migration for Matex support, AI reports, notifications, and analytics
--- Uses IF NOT EXISTS and safe column additions.
+-- Phase 21 / 22 audit migration for payment workflow and workspace persistence
+-- Safe for repeated application: uses IF NOT EXISTS and guarded column additions.
 
 CREATE TABLE IF NOT EXISTS public.matex_orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -12,8 +12,6 @@ CREATE TABLE IF NOT EXISTS public.matex_orders (
   amount numeric(12,2) DEFAULT 0,
   amount_paid numeric(12,2) DEFAULT 0,
   amount_remaining numeric(12,2) DEFAULT 0,
-  amount_due numeric(12,2) DEFAULT 0,
-  remaining_balance numeric(12,2) DEFAULT 0,
   payment_method text,
   payment_type text,
   payment_plan text,
@@ -22,8 +20,6 @@ CREATE TABLE IF NOT EXISTS public.matex_orders (
   payment_date timestamptz,
   paid_at timestamptz,
   download_access boolean DEFAULT false,
-  downloads_locked boolean DEFAULT true,
-  preview_ready boolean DEFAULT false,
   order_status text DEFAULT 'Pending',
   revision_count integer DEFAULT 0,
   revisions_allowed integer DEFAULT 0,
@@ -90,33 +86,10 @@ CREATE TABLE IF NOT EXISTS public.matex_revisions (
   order_id text NOT NULL,
   title text,
   notes text,
-  customer_message text,
-  priority text DEFAULT 'normal',
   status text DEFAULT 'requested',
-  admin_reply text,
   revisions_used integer DEFAULT 0,
   revisions_remaining integer DEFAULT 0,
-  revision_number integer DEFAULT 0,
-  revision_title text,
-  revision_notes text,
-  revision_status text DEFAULT 'pending',
-  revision_files jsonb DEFAULT '[]'::jsonb,
-  revision_comments jsonb DEFAULT '[]'::jsonb,
-  preview_files jsonb DEFAULT '[]'::jsonb,
-  preview_comments jsonb DEFAULT '[]'::jsonb,
-  preview_status text DEFAULT 'pending',
-  revision_history jsonb DEFAULT '[]'::jsonb,
-  revision_created_at timestamptz DEFAULT now(),
-  revision_updated_at timestamptz DEFAULT now(),
-  admin_response text,
-  customer_response text,
-  revision_completed boolean DEFAULT false,
-  approved_by_admin boolean DEFAULT false,
-  created_at timestamptz DEFAULT now(),
-  updated_at timestamptz DEFAULT now(),
-  approved_at timestamptz,
-  rejected_at timestamptz,
-  completed_at timestamptz
+  created_at timestamptz DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS public.matex_support_conversations (
@@ -158,6 +131,40 @@ CREATE TABLE IF NOT EXISTS public.matex_payments (
   created_at timestamptz DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS public.matex_receipts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  receipt_id text NOT NULL UNIQUE,
+  order_id text NOT NULL,
+  reference text,
+  path text,
+  amount_paid numeric(12,2) DEFAULT 0,
+  generated_at timestamptz DEFAULT now(),
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.matex_reviews (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  full_name text,
+  company text,
+  rating integer,
+  message text,
+  status text DEFAULT 'Pending',
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.matex_email_replies (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  from_email text,
+  subject text,
+  body text,
+  html text,
+  order_id text,
+  message_id text,
+  in_reply_to text,
+  created_at timestamptz DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS public.matex_notifications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id text,
@@ -175,12 +182,19 @@ CREATE TABLE IF NOT EXISTS public.matex_analytics_events (
   created_at timestamptz DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS public.matex_history (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id text,
+  admin_name text,
+  admin_id text,
+  action text,
+  notes text,
+  metadata jsonb,
+  created_at timestamptz DEFAULT now()
+);
+
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS currency text DEFAULT 'NGN';
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS conversation_id text;
-ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS amount_due numeric(12,2) DEFAULT 0;
-ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS remaining_balance numeric(12,2) DEFAULT 0;
-ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS downloads_locked boolean DEFAULT true;
-ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS preview_ready boolean DEFAULT false;
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS latest_progress text;
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS status_history jsonb;
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS metadata jsonb;
@@ -191,12 +205,28 @@ ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS dob text;
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS deadline text;
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS reference_link text;
 ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS additional_note text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS payment_plan text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS amount_paid numeric(12,2) DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS amount_remaining numeric(12,2) DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revisions_allowed integer DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revisions_used integer DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revisions_remaining integer DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS revision_count integer DEFAULT 0;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS download_access boolean DEFAULT false;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS order_status text DEFAULT 'Pending';
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS payment_status text DEFAULT 'Pending';
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS payment_reference text;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS payment_date timestamptz;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS paid_at timestamptz;
+ALTER TABLE public.matex_orders ADD COLUMN IF NOT EXISTS created_at timestamptz DEFAULT now();
 
 ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS order_id text;
 ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS unread_admin_count integer DEFAULT 0;
 ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS unread_customer_count integer DEFAULT 0;
 ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS source text;
 ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS service text;
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS last_message_at timestamptz DEFAULT now();
+ALTER TABLE public.matex_chat_conversations ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
 
 ALTER TABLE public.matex_chat_messages ADD COLUMN IF NOT EXISTS sender_email text;
 ALTER TABLE public.matex_chat_messages ADD COLUMN IF NOT EXISTS is_system boolean DEFAULT false;
@@ -204,31 +234,8 @@ ALTER TABLE public.matex_chat_messages ADD COLUMN IF NOT EXISTS is_system boolea
 ALTER TABLE public.matex_order_files ADD COLUMN IF NOT EXISTS delivery_status text DEFAULT 'pending';
 ALTER TABLE public.matex_order_files ADD COLUMN IF NOT EXISTS notify_sent boolean DEFAULT false;
 
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS customer_message text;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS priority text DEFAULT 'normal';
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS admin_reply text;
 ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revisions_used integer DEFAULT 0;
 ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revisions_remaining integer DEFAULT 0;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_number integer DEFAULT 0;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_title text;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_notes text;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_status text DEFAULT 'pending';
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_files jsonb DEFAULT '[]'::jsonb;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_comments jsonb DEFAULT '[]'::jsonb;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS preview_files jsonb DEFAULT '[]'::jsonb;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS preview_comments jsonb DEFAULT '[]'::jsonb;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS preview_status text DEFAULT 'pending';
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_history jsonb DEFAULT '[]'::jsonb;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_created_at timestamptz DEFAULT now();
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_updated_at timestamptz DEFAULT now();
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS admin_response text;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS customer_response text;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS revision_completed boolean DEFAULT false;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS approved_by_admin boolean DEFAULT false;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS approved_at timestamptz;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS rejected_at timestamptz;
-ALTER TABLE public.matex_revisions ADD COLUMN IF NOT EXISTS completed_at timestamptz;
 
 ALTER TABLE public.matex_support_conversations ADD COLUMN IF NOT EXISTS assigned_admin text;
 ALTER TABLE public.matex_support_conversations ADD COLUMN IF NOT EXISTS unread_count integer DEFAULT 1;
@@ -243,10 +250,15 @@ ALTER TABLE public.matex_ai_reports ADD COLUMN IF NOT EXISTS status text DEFAULT
 
 CREATE INDEX IF NOT EXISTS idx_matex_orders_order_id ON public.matex_orders(order_id);
 CREATE INDEX IF NOT EXISTS idx_matex_orders_created_at ON public.matex_orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_matex_orders_payment_status ON public.matex_orders(payment_status);
+CREATE INDEX IF NOT EXISTS idx_matex_orders_download_access ON public.matex_orders(download_access);
 CREATE INDEX IF NOT EXISTS idx_matex_chat_conversations_order_id ON public.matex_chat_conversations(order_id);
 CREATE INDEX IF NOT EXISTS idx_matex_chat_messages_conversation_id ON public.matex_chat_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_matex_order_files_order_id ON public.matex_order_files(order_id);
 CREATE INDEX IF NOT EXISTS idx_matex_support_conversations_status ON public.matex_support_conversations(status);
 CREATE INDEX IF NOT EXISTS idx_matex_ai_reports_status ON public.matex_ai_reports(status);
-
--- RLS policies are optional and can be enabled by the platform; create them when appropriate.
+CREATE INDEX IF NOT EXISTS idx_matex_receipts_order_id ON public.matex_receipts(order_id);
+CREATE INDEX IF NOT EXISTS idx_matex_receipts_receipt_id ON public.matex_receipts(receipt_id);
+CREATE INDEX IF NOT EXISTS idx_matex_reviews_status ON public.matex_reviews(status);
+CREATE INDEX IF NOT EXISTS idx_matex_notifications_order_id ON public.matex_notifications(order_id);
+CREATE INDEX IF NOT EXISTS idx_matex_history_order_id ON public.matex_history(order_id);

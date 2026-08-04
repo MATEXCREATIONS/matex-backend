@@ -1154,18 +1154,6 @@ function normalizePaymentPlan(value, paymentTypeValue = null) {
   return 'full';
 }
 
-function computeRevisionState(order = {}) {
-  const paymentType = String(order.payment_type || order.paymentType || order.paymentMethod || '').toLowerCase();
-  const allowed = Number.isFinite(Number(order.revisions_allowed))
-    ? Number(order.revisions_allowed)
-    : (Number.isFinite(Number(order.revision_count)) ? Number(order.revision_count) : getRevisionCount(paymentType));
-  const used = Number.isFinite(Number(order.revisions_used))
-    ? Number(order.revisions_used)
-    : (Number.isFinite(Number(order.revision_count)) ? Number(order.revision_count) : 0);
-  const remaining = Math.max(allowed - used, 0);
-  return { allowed, used, remaining };
-}
-
 function normalizeOrderRecord(order) {
   if (!order || !order.order_id) return null;
   const amount = typeof order.amount === 'number' ? order.amount : (Number(order.amount) || null);

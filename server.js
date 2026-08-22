@@ -649,6 +649,9 @@ const chatMessagesStore = new Map();
 const orderFilesStore = new Map();
 const aiReportStore = new Map();
 
+// In-memory fallback store for receipts when Supabase is not configured
+const receiptStore = new Map();
+
 function normalizeOrderFile(record) {
   const now = new Date().toISOString();
   return {
@@ -1228,9 +1231,10 @@ function normalizeOrderRecord(order) {
 function buildSupabaseOrderPayload(orderRecord) {
   const payload = {};
   for (const field of SUPABASE_ORDER_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(orderRecord, field)) {
-      payload[field] = orderRecord[field];
-    }
+    if (!Object.prototype.hasOwnProperty.call(orderRecord, field)) continue;
+    const value = orderRecord[field];
+    if (typeof value === 'undefined' || value === null) continue;
+    payload[field] = value;
   }
   return payload;
 }
@@ -1270,18 +1274,6 @@ async function persistOrder(order) {
   if (!supabase) return order;
 
   const safePayload = buildSupabaseOrderPayload(record);
-  if (typeof safePayload.amount_paid === 'undefined') {
-    safePayload.amount_paid = 0;
-  }
-  if (typeof safePayload.revision_count === 'undefined') {
-    safePayload.revision_count = record.revision_count;
-  }
-  if (typeof safePayload.amount_paid === 'undefined') {
-    safePayload.amount_paid = 0;
-  }
-  if (typeof safePayload.revision_count === 'undefined') {
-    safePayload.revision_count = record.revision_count;
-  }
   try {
     // Fetch existing row to avoid unintentionally nullifying previously-saved fields
     let existing = null;
@@ -1292,15 +1284,8 @@ async function persistOrder(order) {
       console.warn('Supabase fetch existing row warning for', record.order_id, e?.message || e);
     }
 
-    // Merge - prefer new non-null values from record, fall back to existing values
-    const merged = Object.assign({}, existing || {});
-    for (const key of SUPABASE_ORDER_FIELDS) {
-      if (Object.prototype.hasOwnProperty.call(record, key)) {
-        // only overwrite if record has a non-undefined value (allow null to clear intentionally)
-        merged[key] = record[key];
-      }
-    }
-
+    // Merge existing row with the sanitized record payload. This avoids overwriting saved fields with null/undefined values.
+    const merged = Object.assign({}, existing || {}, safePayload);
     let persisted = merged;
     try {
       const { data, error } = await supabase.from('matex_orders').upsert([merged], { onConflict: 'order_id' }).select();
@@ -2176,24 +2161,26 @@ app.get('/api/orders/:orderId/files', async (req, res) => {
     }
     if (!order) order = orderStore.get(orderId) || null;
 
+    // Determine download access based on full payment
+    // Downloads allowed only if the order has been fully paid or explicit download_access is true
+    const isFullyPaid = Boolean(order && ((typeof order.amount_paid === 'number' && typeof order.amount === 'number' && order.amount_paid >= (order.amount || 0)) || order.download_access));
+
     const files = await loadOrderFiles(orderId);
-    const adminFiles = files.filter(f => String(f.uploaded_by || '').toLowerCase() !== 'customer' && String(f.metadata?.file_type || '').toLowerCase() !== 'brief');
-    const isDownloadAllowed = Boolean(order && order.download_access);
+    const adminFiles = files.filter(f => String(f.uploaded_by || '').toLowerCase() !== 'customer' && String(f.file_type || f.metadata?.file_type || '').toLowerCase() !== 'brief');
+    const isDownloadAllowed = isFullyPaid;
 
     const mapped = await Promise.all(adminFiles.map(async f => {
-      const fileType = String(f.metadata?.file_type || '').toLowerCase();
+      const fileType = String(f.file_type || f.metadata?.file_type || '').toLowerCase();
       const downloadAllowed = isDownloadAllowed && (fileType === 'final');
       let download_url = null;
       let preview_url = null;
       if (supabase && f.storage_path) {
-        if (fileType === 'revision' || (fileType === 'final' && !downloadAllowed)) {
-          preview_url = await createSignedUrlForFile(f.bucket_name || 'order-deliveries', f.storage_path, 3600);
-        }
+        preview_url = await createSignedUrlForFile(f.bucket_name || 'order-deliveries', f.storage_path, 3600);
         if (downloadAllowed) {
-          download_url = await createSignedUrlForFile(f.bucket_name || 'order-deliveries', f.storage_path, 3600);
+          download_url = preview_url;
         }
       }
-      return Object.assign({}, f, { download_allowed: downloadAllowed, download_url, preview_url });
+      return Object.assign({}, f, { download_allowed: downloadAllowed, download_url, preview_url, file_type: fileType });
     }));
 
     return res.json({ success: true, files: mapped, download_access: isDownloadAllowed });
